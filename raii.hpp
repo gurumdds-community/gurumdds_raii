@@ -1331,6 +1331,31 @@ public:
 	}
 };
 
+// Expand at global scope after including the generated TypeSupport header.
+// Only sample allocation, deserialization and release are wrapped. The generated
+// TypeSupport singleton remains borrowed and the generated C files stay intact.
+#define RAII_TYPESUPPORT_DEFINE(TypeSupport, Type)                                    \
+    namespace raii {                                                                \
+    struct TypeSupport##_sample_deleter {                                            \
+        ::dds_ReturnCode_t operator()(::Type* raw) const noexcept {                   \
+            ::TypeSupport##_free(raw);                                              \
+            return dds_RETCODE_OK;                                                  \
+        }                                                                           \
+    };                                                                              \
+    using Type = ::raii::Resource<::Type, TypeSupport##_sample_deleter>;               \
+    inline Type TypeSupport##_alloc() {                                             \
+        return Type::create([]() { return ::TypeSupport##_alloc(); });               \
+    }                                                                               \
+    inline void TypeSupport##_free(Type& sample) noexcept {                          \
+        sample.reset();                                                             \
+    }                                                                               \
+    inline Type TypeSupport##_deserialize(void* input, size_t input_size) {          \
+        return Type::create([&]() {                                                 \
+            return ::TypeSupport##_deserialize(input, input_size);                   \
+        });                                                                         \
+    }                                                                               \
+    }
+
 #define RAII_SEQUENCE_DEFINE(seq_type)                                                                                 \
 	struct seq_type##_deleter {                                                                                        \
 		::dds_ReturnCode_t operator()(::seq_type* raw) const noexcept {                                                \

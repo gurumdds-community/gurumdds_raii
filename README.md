@@ -105,6 +105,56 @@ A native pointer obtained from a handle is borrowed. Keep the owning handle aliv
 
 For explicit entity deletion, use the matching `raii::dds_*_delete_*` function and check its return code. Deletion may return `dds_RETCODE_PRECONDITION_NOT_MET` while the entity is retained by another handle or dependent resource.
 
+## IDL-generated samples
+
+Include the generated TypeSupport header and invoke `RAII_TYPESUPPORT_DEFINE`
+once per type in a C++ adapter header, at global scope outside any `extern "C"`
+block. The generated C and header files do not need changes:
+
+```cpp
+#include "FooTypeSupport.h"
+#include "raii.hpp"
+
+RAII_TYPESUPPORT_DEFINE(FooTypeSupport, Foo)
+```
+
+This defines the move-only sample owner `raii::Foo` and exactly three wrappers:
+
+| Wrapper | Behavior |
+| --- | --- |
+| `raii::FooTypeSupport_alloc()` | Calls generated `::FooTypeSupport_alloc()` and owns the returned sample. |
+| `raii::FooTypeSupport_free(sample)` | Releases the sample owner; cleanup calls generated `::FooTypeSupport_free()`. |
+| `raii::FooTypeSupport_deserialize(input, size)` | Calls generated deserialization and owns the returned sample. |
+
+```cpp
+auto sample = raii::FooTypeSupport_alloc();
+if (!sample)
+    return EXIT_FAILURE;
+
+// Existing operations accept the owner's implicit Foo* conversion.
+::FooDataWriter_write(writer, sample, dds_HANDLE_NIL);
+
+// Optional explicit release; otherwise cleanup happens at scope exit.
+raii::FooTypeSupport_free(sample);
+
+auto decoded = raii::FooTypeSupport_deserialize(buffer, size);
+```
+
+Allocation and deserialization failures produce empty owners. Moving an owner
+transfers its cleanup responsibility. Initialize allocated data according to the
+generated API before passing it to a writer. The macro preserves the generated
+allocator/deserializer behavior.
+
+Registration, type-name lookup, serialization, and DataWriter/DataReader operations
+continue to use their existing APIs. Resources returned by those APIs must still
+be managed according to their own ownership rules. Do not call the native sample
+free function on a managed sample unless ownership was transferred with
+`sample.release()`.
+
+The macro manages samples only. The generated TypeSupport singleton remains
+borrowed and is never adopted or deleted by these wrappers. No metadata access,
+new TypeSupport instances, or Participant lifetime changes are introduced.
+
 ## Factory lifetime
 
 Use the wrapper accessor to obtain the Participant Factory singleton:
