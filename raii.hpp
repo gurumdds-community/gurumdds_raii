@@ -155,6 +155,8 @@ public:
 	using native_type = DDSType;
 
 	DDSEntity() = default;
+	DDSEntity(std::nullptr_t) noexcept {
+	}
 
 	explicit DDSEntity(std::shared_ptr<TImpl> impl)
 	    : m_sharedptr(std::move(impl)) {
