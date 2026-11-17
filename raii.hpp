@@ -624,6 +624,26 @@ private:
 // -----------------------------------------------------------------------------
 // DomainParticipantFactory wrappers
 // -----------------------------------------------------------------------------
+// Use this accessor before creating DDS resources to register normal-exit cleanup.
+// All DDS users must finish before the function-local shutdown guard is destroyed.
+inline ::dds_DomainParticipantFactory* dds_DomainParticipantFactory_get_instance() {
+	struct ShutdownGuard {
+		~ShutdownGuard() noexcept {
+			detail::terminate_on_error(::dds_DynamicDataFactory_delete_instance(), "dds_DynamicDataFactory_delete_instance");
+			detail::terminate_on_error(
+			    ::dds_DynamicTypeBuilderFactory_delete_instance(), "dds_DynamicTypeBuilderFactory_delete_instance");
+			::dds_DomainParticipantFactory_shutdown();
+		}
+	};
+
+	auto* factory = ::dds_DomainParticipantFactory_get_instance();
+	if(factory != nullptr) {
+		static ShutdownGuard guard;
+		(void)guard;
+	}
+	return factory;
+}
+
 inline dds_DomainParticipant dds_DomainParticipantFactory_create_participant(::dds_DomainParticipantFactory* self,
     ::dds_DomainId_t domain_id,
     const ::dds_DomainParticipantQos* qos,

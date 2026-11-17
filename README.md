@@ -12,6 +12,7 @@ A header-only C++11 RAII wrapper for the GurumDDS C API, providing automatic res
 - Reader and writer loan adapters, including automatic return of managed sequence loans.
 - WaitSet attachments that retain managed conditions until detached or released with the WaitSet.
 - Implicit conversion to native C pointers for interoperability with the GurumDDS C API.
+- Automatic singleton cleanup at normal program exit.
 
 ## Requirements
 
@@ -45,7 +46,7 @@ Save the following as `main.cpp`:
 
 int main() {
     try {
-        auto* factory = ::dds_DomainParticipantFactory_get_instance();
+        auto* factory = raii::dds_DomainParticipantFactory_get_instance();
         if (!factory) {
             return EXIT_FAILURE;
         }
@@ -104,6 +105,18 @@ A native pointer obtained from a handle is borrowed. Keep the owning handle aliv
 
 For explicit entity deletion, use the matching `raii::dds_*_delete_*` function and check its return code. Deletion may return `dds_RETCODE_PRECONDITION_NOT_MET` while the entity is retained by another handle or dependent resource.
 
+## Factory lifetime
+
+Use the wrapper accessor to obtain the Participant Factory singleton:
+
+```cpp
+auto* factory = raii::dds_DomainParticipantFactory_get_instance();
+```
+
+The first successful call registers automatic cleanup at normal program exit. Repeated calls return the same native singleton without registering additional cleanup. No explicit `shutdown()` call is needed when using this accessor.
+
+Release DDS resources and stop DDS worker threads before program exit. The wrapper then cleans up the DynamicData and DynamicTypeBuilder factories before shutting down the Participant Factory. Global or static DDS resources must also be destroyed before this automatic cleanup runs.
+
 ## Loans and resource release
 
 Managed reader sequence loans are returned when their participating sequence owners are destroyed or reused. The active loan retains its DataReader. Use the matching wrapper return-loan function when you need to return a loan explicitly and inspect the result.
@@ -120,7 +133,7 @@ When transferring a writer loan to a native `raw_write` API, explicitly use `sam
 - **Provide external synchronization.** Shared ownership does not make handle operations or native DDS resources thread-safe.
 - **Destructor cleanup failures terminate the process.** For cleanup paths that check native return codes, a failure calls `std::terminate()`. Use `close()` or the corresponding explicit wrapper deletion function when you need to inspect cleanup errors before destruction.
 - **Allocation can throw.** C++ allocation failures propagate as exceptions. Native create functions that return null produce empty handles. Converting an empty or closed entity handle to a native pointer throws `std::logic_error`; check the handle first or use `get()` to inspect it.
-- **Some objects remain native handles.** DynamicTypeBuilder objects and singleton factories are not independently owned by this wrapper. Follow the SDK's lifetime rules for those objects.
+- **Some objects remain native handles.** DynamicTypeBuilder objects and singleton factory pointers are not independently owned by this wrapper. The Participant Factory singleton is cleaned up automatically when accessed through the wrapper.
 
 ## License
 
