@@ -97,7 +97,17 @@ Use qualified `raii::dds_*` names for resource creation and deletion. Other oper
 | --- | --- |
 | Entity handles, such as `raii::dds_DomainParticipant` | Copyable handles sharing the same managed entity. Children retain required parent handles. |
 | `raii::Resource<T, Deleter>` aliases | Move-only owners. Use `get()` for a borrowed pointer, `reset()` to release ownership, and `close()` for an explicit cleanup result. |
-| QoS wrappers | Scoped objects that finalize their native values. They are neither copyable nor movable; use the provided copy functions. |
+| QoS and descriptor wrappers | Move-only scoped objects that finalize their native values. Use the provided copy functions for explicit deep copies. |
+
+Moving a QoS or descriptor wrapper transfers its native resources and resets the source to zero-initialized storage. Move assignment finalizes the destination’s previous resources; self-move assignment leaves it unchanged. Native pointers to the source wrapper’s storage do not follow the move.
+
+Run the ownership regression tests against an installed GurumDDS SDK:
+
+```sh
+g++ -std=c++11 -Wall -Wextra -Werror -fsanitize=address,undefined \
+    -fno-omit-frame-pointer -g tests/move.cpp -lgurumdds -o /tmp/gurumdds-raii-move-test
+/tmp/gurumdds-raii-move-test
+```
 
 QoS wrappers start with zero-initialized storage. Obtain valid default QoS values using the corresponding `raii::dds_*_get_default_*_qos` function before creating an entity, as shown above.
 

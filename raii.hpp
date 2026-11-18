@@ -1415,8 +1415,19 @@ RAII_SEQUENCE_DEFINE(dds_KeyedBytesSeq)
 		qos_type() noexcept = default;                                                                                 \
 		qos_type(const qos_type&) = delete;                                                                            \
 		qos_type& operator=(const qos_type&) = delete;                                                                 \
-		qos_type(qos_type&&) = delete;                                                                                 \
-		qos_type& operator=(qos_type&&) = delete;                                                                      \
+		/* Transfer ownership; leave the source safe to finalize or reuse. */                                          \
+		qos_type(qos_type&& other) noexcept                                                                            \
+		    : qos_entity_(other.qos_entity_) {                                                                         \
+			other.qos_entity_ = native_type{};                                                                         \
+		}                                                                                                              \
+		qos_type& operator=(qos_type&& other) noexcept {                                                               \
+			if(this != &other) {                                                                                       \
+				detail::terminate_on_error(::qos_type##_finalize(&qos_entity_), "move assignment cleanup");            \
+				qos_entity_ = other.qos_entity_;                                                                       \
+				other.qos_entity_ = native_type{};                                                                     \
+			}                                                                                                          \
+			return *this;                                                                                              \
+		}                                                                                                              \
                                                                                                                        \
 		operator native_type*() noexcept {                                                                             \
 			return &qos_entity_;                                                                                       \
@@ -1575,8 +1586,19 @@ inline ::dds_ReturnCode_t dds_DomainParticipantFactory_get_datareader_qos_from_p
 		type() noexcept = default;                                                                                     \
 		type(const type&) = delete;                                                                                    \
 		type& operator=(const type&) = delete;                                                                         \
-		type(type&&) = delete;                                                                                         \
-		type& operator=(type&&) = delete;                                                                              \
+		/* Transfer ownership; leave the source safe to finalize or reuse. */                                          \
+		type(type&& other) noexcept                                                                                    \
+		    : value_(other.value_) {                                                                                   \
+			other.value_ = native_type{};                                                                              \
+		}                                                                                                              \
+		type& operator=(type&& other) noexcept {                                                                       \
+			if(this != &other) {                                                                                       \
+				detail::terminate_on_error(::type##_finalize(&value_), "move assignment cleanup");                     \
+				value_ = other.value_;                                                                                 \
+				other.value_ = native_type{};                                                                          \
+			}                                                                                                          \
+			return *this;                                                                                              \
+		}                                                                                                              \
 		operator ::type*() noexcept {                                                                                  \
 			return &value_;                                                                                            \
 		}                                                                                                              \
