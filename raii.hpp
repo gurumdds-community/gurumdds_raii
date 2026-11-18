@@ -914,6 +914,48 @@ inline dds_DataWriter dds_Publisher_create_datawriter_w_profile(const dds_Publis
 	return dds_DataWriter(detail::make_owned<DataWriter>(raw, detail::shared_impl(self), detail::shared_impl(a_topic)));
 }
 
+// Raw topic pointers are borrowed. The caller must keep the topic alive until
+// the endpoint is deleted; only its publisher/subscriber is retained.
+inline dds_DataWriter dds_Publisher_create_datawriter(const dds_Publisher& self,
+    const ::dds_Topic* a_topic,
+    const ::dds_DataWriterQos* qos,
+    const ::dds_DataWriterListener* a_listener,
+    ::dds_StatusMask mask) {
+	::dds_DataWriter* raw =
+	    ::dds_Publisher_create_datawriter(static_cast<::dds_Publisher*>(self), a_topic, qos, a_listener, mask);
+	if(raw == nullptr) {
+		return {};
+	}
+	return dds_DataWriter(detail::make_owned<DataWriter>(raw, detail::shared_impl(self), std::shared_ptr<Topic>{}));
+}
+
+inline dds_DataWriter dds_Publisher_create_datawriter_w_props(const dds_Publisher& self,
+    const ::dds_Topic* a_topic,
+    const ::dds_DataWriterQos* qos,
+    const ::dds_DataWriterListener* a_listener,
+    ::dds_StatusMask mask,
+    ::dds_StringProperty* props) {
+	::dds_DataWriter* raw = ::dds_Publisher_create_datawriter_w_props(
+	    static_cast<::dds_Publisher*>(self), a_topic, qos, a_listener, mask, props);
+	if(raw == nullptr) {
+		return {};
+	}
+	return dds_DataWriter(detail::make_owned<DataWriter>(raw, detail::shared_impl(self), std::shared_ptr<Topic>{}));
+}
+
+inline dds_DataWriter dds_Publisher_create_datawriter_w_profile(const dds_Publisher& self,
+    const ::dds_Topic* a_topic,
+    const char* profile_name,
+    const ::dds_DataWriterListener* a_listener,
+    ::dds_StatusMask mask) {
+	::dds_DataWriter* raw = ::dds_Publisher_create_datawriter_w_profile(
+	    static_cast<::dds_Publisher*>(self), a_topic, profile_name, a_listener, mask);
+	if(raw == nullptr) {
+		return {};
+	}
+	return dds_DataWriter(detail::make_owned<DataWriter>(raw, detail::shared_impl(self), std::shared_ptr<Topic>{}));
+}
+
 inline ::dds_ReturnCode_t dds_Publisher_delete_datawriter(const dds_Publisher& self, dds_DataWriter& a_datawriter) {
 	if(!self || !a_datawriter) {
 		return detail::bad_parameter();
@@ -991,6 +1033,48 @@ inline dds_DataReader dds_Subscriber_create_datareader_w_profile(const dds_Subsc
 		return {};
 	}
 	return dds_DataReader(detail::make_owned<DataReader>(raw, detail::shared_impl(self), detail::shared_impl(a_topic)));
+}
+
+// Raw topic descriptions are borrowed; no C++ topic owner is retained.
+inline dds_DataReader dds_Subscriber_create_datareader(const dds_Subscriber& self,
+    const ::dds_TopicDescription* a_topic,
+    const ::dds_DataReaderQos* qos,
+    const ::dds_DataReaderListener* a_listener,
+    ::dds_StatusMask mask) {
+	::dds_DataReader* raw =
+	    ::dds_Subscriber_create_datareader(static_cast<::dds_Subscriber*>(self), a_topic, qos, a_listener, mask);
+	if(raw == nullptr) {
+		return {};
+	}
+	return dds_DataReader(detail::make_owned<DataReader>(raw, detail::shared_impl(self), std::shared_ptr<void>{}));
+}
+
+// Accept the native topic types as well as the common TopicDescription pointer.
+// Restrict deduction to native types so existing RAII overloads keep ownership.
+template <typename NativeTopic>
+inline typename std::enable_if<std::is_same<NativeTopic, ::dds_Topic>::value ||
+                                   std::is_same<NativeTopic, ::dds_ContentFilteredTopic>::value ||
+                                   std::is_same<NativeTopic, ::dds_MultiTopic>::value,
+    dds_DataReader>::type
+dds_Subscriber_create_datareader(const dds_Subscriber& self,
+    const NativeTopic* a_topic,
+    const ::dds_DataReaderQos* qos,
+    const ::dds_DataReaderListener* a_listener,
+    ::dds_StatusMask mask) {
+	return raii::dds_Subscriber_create_datareader(self, detail::topic_description_cast(a_topic), qos, a_listener, mask);
+}
+
+inline dds_DataReader dds_Subscriber_create_datareader_w_profile(const dds_Subscriber& self,
+    const ::dds_Topic* a_topic,
+    const char* profile_name,
+    const ::dds_DataReaderListener* a_listener,
+    ::dds_StatusMask mask) {
+	::dds_DataReader* raw = ::dds_Subscriber_create_datareader_w_profile(
+	    static_cast<::dds_Subscriber*>(self), a_topic, profile_name, a_listener, mask);
+	if(raw == nullptr) {
+		return {};
+	}
+	return dds_DataReader(detail::make_owned<DataReader>(raw, detail::shared_impl(self), std::shared_ptr<void>{}));
 }
 
 inline ::dds_ReturnCode_t dds_Subscriber_delete_datareader(const dds_Subscriber& self, dds_DataReader& a_datareader) {
