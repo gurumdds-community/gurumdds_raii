@@ -19,6 +19,8 @@
 // Native listeners/context pointers remain borrowed, as in the C API.
 // Handles and their native resources require external synchronization.
 #include <algorithm>
+#include <chrono>
+#include <condition_variable>
 #include <exception>
 #include <functional>
 #include <iostream>
@@ -55,6 +57,31 @@ std::shared_ptr<TImpl>& SharedImpl(DDSEntity<TImpl>& h) noexcept;
 
 template <typename TImpl>
 const std::shared_ptr<TImpl>& SharedImpl(const DDSEntity<TImpl>& h) noexcept;
+
+// Factory operations only coordinate participant creation, lookup and deletion.
+// All child-entity lifetime operations use their owning participant's state.
+inline std::recursive_mutex& GetFactoryMutex() {
+	static std::recursive_mutex s_mutex;
+	return s_mutex;
+}
+
+struct LifecycleState {
+	std::recursive_mutex m_mutex;
+	// Allocate only when find first waits, preserving participant construction.
+	std::unique_ptr<std::condition_variable_any> m_changed;
+};
+
+struct LifecycleLock;
+
+inline std::shared_ptr<DomainParticipant> GetParticipant(
+    const std::shared_ptr<DomainParticipant>& participant) noexcept;
+
+template <typename TImpl>
+std::shared_ptr<DomainParticipant> GetParticipant(const std::shared_ptr<TImpl>& impl) noexcept {
+	return impl ? GetParticipant(impl->m_parent) : std::shared_ptr<DomainParticipant>{};
+}
+
+inline void NotifyLifecycle(const std::shared_ptr<DomainParticipant>& participant);
 
 inline void TerminateOnError(::dds_ReturnCode_t ret, const char* func) noexcept {
 	if(ret != dds_RETCODE_OK) {
@@ -248,8 +275,8 @@ std::shared_ptr<TImpl> MakeOwned(TRaw* raw, const TArgs&... args) {
 	}
 }
 
-// Weak entries never keep entities alive. Native DDS operations still require
-// external synchronization, including lookup versus final-owner destruction.
+// Weak entries never keep entities alive. Lifecycle operations acquire the
+// lifecycle mutex before a registry mutex. Raw C API calls remain externally synchronized.
 template <typename TImpl>
 struct OwnerRegistry {
 	std::mutex m_mutex;
@@ -292,6 +319,7 @@ std::shared_ptr<TImpl> MakeRegisteredOwned(TRaw* raw, const TArgs&... args) {
 			++it;
 	}
 	registry.m_owners[raw] = owner;
+	NotifyLifecycle(GetParticipant(owner));
 	return owner;
 }
 
@@ -327,6 +355,8 @@ public:                                                                         
 	}                                                                                                                  \
                                                                                                                        \
 private:                                                                                                               \
+	template <typename TImpl>                                                                                          \
+	friend std::shared_ptr<DomainParticipant> detail::GetParticipant(const std::shared_ptr<TImpl>&) noexcept;          \
 	template <typename>                                                                                                \
 	friend class ::raii::DDSEntity
 
@@ -339,6 +369,8 @@ public:
 	}
 
 	~DomainParticipant() noexcept {
+		std::lock_guard<std::recursive_mutex> lifecycleLock(m_lifecycle.m_mutex);
+		std::lock_guard<std::recursive_mutex> factoryLock(detail::GetFactoryMutex());
 		if(m_entity == nullptr) {
 			return;
 		}
@@ -350,8 +382,57 @@ public:
 	}
 
 private:
+	detail::LifecycleState m_lifecycle;
+	friend struct detail::LifecycleLock;
+	friend void detail::NotifyLifecycle(const std::shared_ptr<DomainParticipant>&);
 	::dds_DomainParticipant* m_entity{nullptr};
 };
+
+namespace detail {
+inline std::shared_ptr<DomainParticipant> GetParticipant(
+    const std::shared_ptr<DomainParticipant>& participant) noexcept {
+	return participant;
+}
+
+// The guard pins the participant so its mutex survives handle reset/deletion.
+// Member order releases the mutex before releasing the participant pin.
+struct LifecycleLock {
+	std::shared_ptr<DomainParticipant> m_participant;
+	std::unique_lock<std::recursive_mutex> m_lock;
+
+	explicit LifecycleLock(std::shared_ptr<DomainParticipant> participant)
+	    : m_participant(std::move(participant))
+	    , m_lock(m_participant ? std::unique_lock<std::recursive_mutex>(m_participant->m_lifecycle.m_mutex)
+	                           : std::unique_lock<std::recursive_mutex>{}) {
+	}
+
+	void Wait() {
+		GetChanged().wait(m_lock);
+	}
+
+	void WaitUntil(const std::chrono::steady_clock::time_point& deadline) {
+		GetChanged().wait_until(m_lock, deadline);
+	}
+
+private:
+	std::condition_variable_any& GetChanged() {
+		auto& changed = m_participant->m_lifecycle.m_changed;
+		if(!changed)
+			changed.reset(new std::condition_variable_any);
+		return *changed;
+	}
+};
+
+template <typename TImpl>
+LifecycleLock LockLifecycle(const std::shared_ptr<TImpl>& impl) {
+	return LifecycleLock(GetParticipant(impl));
+}
+
+inline void NotifyLifecycle(const std::shared_ptr<DomainParticipant>& participant) {
+	if(participant && participant->m_lifecycle.m_changed)
+		participant->m_lifecycle.m_changed->notify_all();
+}
+} // namespace detail
 
 class Topic {
 	RAII_DDS_IMPL_OPERATORS(Topic, ::dds_Topic);
@@ -363,6 +444,7 @@ public:
 	}
 
 	~Topic() noexcept {
+		auto lifecycleLock = detail::LockLifecycle(m_parent);
 		if(m_entity == nullptr) {
 			return;
 		}
@@ -392,6 +474,7 @@ public:
 	}
 
 	~ContentFilteredTopic() noexcept {
+		auto lifecycleLock = detail::LockLifecycle(m_parent);
 		if(m_entity == nullptr) {
 			return;
 		}
@@ -418,6 +501,7 @@ public:
 	}
 
 	~MultiTopic() noexcept {
+		auto lifecycleLock = detail::LockLifecycle(m_parent);
 		if(m_entity == nullptr) {
 			return;
 		}
@@ -561,6 +645,7 @@ public:
 	}
 
 	~Publisher() noexcept {
+		auto lifecycleLock = detail::LockLifecycle(m_parent);
 		if(m_entity == nullptr) {
 			return;
 		}
@@ -587,6 +672,7 @@ public:
 	}
 
 	~Subscriber() noexcept {
+		auto lifecycleLock = detail::LockLifecycle(m_parent);
 		if(m_entity == nullptr) {
 			return;
 		}
@@ -614,6 +700,7 @@ public:
 	}
 
 	~DataWriter() noexcept {
+		auto lifecycleLock = detail::LockLifecycle(m_parent);
 		if(m_entity == nullptr) {
 			return;
 		}
@@ -644,6 +731,7 @@ public:
 	}
 
 	~DataReader() noexcept {
+		auto lifecycleLock = detail::LockLifecycle(m_parent);
 		if(m_entity == nullptr) {
 			return;
 		}
@@ -821,6 +909,7 @@ inline dds_DomainParticipant dds_DomainParticipantFactory_create_participant(::d
     const ::dds_DomainParticipantQos* qos,
     const ::dds_DomainParticipantListener* aListener,
     ::dds_StatusMask mask) {
+	std::lock_guard<std::recursive_mutex> factoryLock(detail::GetFactoryMutex());
 	::dds_DomainParticipant* raw =
 	    ::dds_DomainParticipantFactory_create_participant(self, domainId, qos, aListener, mask);
 	if(raw == nullptr) {
@@ -831,7 +920,10 @@ inline dds_DomainParticipant dds_DomainParticipantFactory_create_participant(::d
 
 inline ::dds_ReturnCode_t dds_DomainParticipantFactory_delete_participant(
     ::dds_DomainParticipantFactory* self, dds_DomainParticipant& aParticipant) {
-	if(detail::SharedImpl(aParticipant).use_count() > 1)
+	auto lifecycleLock = detail::LockLifecycle(detail::SharedImpl(aParticipant));
+	std::lock_guard<std::recursive_mutex> factoryLock(detail::GetFactoryMutex());
+	// Exclude the one participant pin held by lifecycleLock.
+	if(detail::SharedImpl(aParticipant).use_count() > 2)
 		return dds_RETCODE_PRECONDITION_NOT_MET;
 	if(!aParticipant) {
 		return detail::BadParameter();
@@ -851,6 +943,7 @@ inline dds_DomainParticipant dds_DomainParticipantFactory_create_participant_w_i
     const ::dds_DomainParticipantQos* qos,
     const ::dds_DomainParticipantListener* aListener,
     ::dds_StatusMask mask) {
+	std::lock_guard<std::recursive_mutex> factoryLock(detail::GetFactoryMutex());
 	::dds_DomainParticipant* raw =
 	    ::dds_DomainParticipantFactory_create_participant_w_id(self, domainId, participantId, qos, aListener, mask);
 	if(raw == nullptr) {
@@ -866,6 +959,7 @@ inline dds_DomainParticipant dds_DomainParticipantFactory_create_participant_w_p
     const ::dds_DomainParticipantListener* aListener,
     ::dds_StatusMask mask,
     ::dds_StringProperty* props) {
+	std::lock_guard<std::recursive_mutex> factoryLock(detail::GetFactoryMutex());
 	::dds_DomainParticipant* raw =
 	    ::dds_DomainParticipantFactory_create_participant_w_props(self, domainId, qos, aListener, mask, props);
 	if(raw == nullptr) {
@@ -880,6 +974,7 @@ inline dds_DomainParticipant dds_DomainParticipantFactory_create_participant_w_p
     const char* profileName,
     const ::dds_DomainParticipantListener* aListener,
     ::dds_StatusMask mask) {
+	std::lock_guard<std::recursive_mutex> factoryLock(detail::GetFactoryMutex());
 	::dds_DomainParticipant* raw =
 	    ::dds_DomainParticipantFactory_create_participant_w_profile(self, domainId, profileName, aListener, mask);
 	if(raw == nullptr) {
@@ -895,6 +990,7 @@ inline dds_Publisher dds_DomainParticipant_create_publisher(const dds_DomainPart
     const ::dds_PublisherQos* qos,
     const ::dds_PublisherListener* aListener,
     ::dds_StatusMask mask) {
+	auto lifecycleLock = detail::LockLifecycle(detail::SharedImpl(self));
 	::dds_Publisher* raw =
 	    ::dds_DomainParticipant_create_publisher(static_cast<::dds_DomainParticipant*>(self), qos, aListener, mask);
 	if(raw == nullptr) {
@@ -905,6 +1001,7 @@ inline dds_Publisher dds_DomainParticipant_create_publisher(const dds_DomainPart
 
 inline ::dds_ReturnCode_t dds_DomainParticipant_delete_publisher(
     const dds_DomainParticipant& self, dds_Publisher& publisher) {
+	auto lifecycleLock = detail::LockLifecycle(detail::SharedImpl(self));
 	if(!self || !publisher) {
 		return detail::BadParameter();
 	}
@@ -924,6 +1021,7 @@ inline dds_Subscriber dds_DomainParticipant_create_subscriber(const dds_DomainPa
     const ::dds_SubscriberQos* qos,
     const ::dds_SubscriberListener* aListener,
     ::dds_StatusMask mask) {
+	auto lifecycleLock = detail::LockLifecycle(detail::SharedImpl(self));
 	::dds_Subscriber* raw =
 	    ::dds_DomainParticipant_create_subscriber(static_cast<::dds_DomainParticipant*>(self), qos, aListener, mask);
 	if(raw == nullptr) {
@@ -934,6 +1032,7 @@ inline dds_Subscriber dds_DomainParticipant_create_subscriber(const dds_DomainPa
 
 inline ::dds_ReturnCode_t dds_DomainParticipant_delete_subscriber(
     const dds_DomainParticipant& self, dds_Subscriber& subscriber) {
+	auto lifecycleLock = detail::LockLifecycle(detail::SharedImpl(self));
 	if(!self || !subscriber) {
 		return detail::BadParameter();
 	}
@@ -955,6 +1054,7 @@ inline dds_Topic dds_DomainParticipant_create_topic(const dds_DomainParticipant&
     const ::dds_TopicQos* qos,
     const ::dds_TopicListener* aListener,
     ::dds_StatusMask mask) {
+	auto lifecycleLock = detail::LockLifecycle(detail::SharedImpl(self));
 	::dds_Topic* raw = ::dds_DomainParticipant_create_topic(
 	    static_cast<::dds_DomainParticipant*>(self), topicName, typeName, qos, aListener, mask);
 	if(raw == nullptr) {
@@ -964,6 +1064,7 @@ inline dds_Topic dds_DomainParticipant_create_topic(const dds_DomainParticipant&
 }
 
 inline ::dds_ReturnCode_t dds_DomainParticipant_delete_topic(const dds_DomainParticipant& self, dds_Topic& topic) {
+	auto lifecycleLock = detail::LockLifecycle(detail::SharedImpl(self));
 	if(!self || !topic) {
 		return detail::BadParameter();
 	}
@@ -983,6 +1084,7 @@ inline dds_ContentFilteredTopic dds_DomainParticipant_create_contentfilteredtopi
     const dds_Topic& relatedTopic,
     const char* filterExpression,
     const ::dds_StringSeq* expressionParameters) {
+	auto lifecycleLock = detail::LockLifecycle(detail::SharedImpl(self));
 	::dds_ContentFilteredTopic* raw =
 	    ::dds_DomainParticipant_create_contentfilteredtopic(static_cast<::dds_DomainParticipant*>(self),
 	        name,
@@ -998,6 +1100,7 @@ inline dds_ContentFilteredTopic dds_DomainParticipant_create_contentfilteredtopi
 
 inline ::dds_ReturnCode_t dds_DomainParticipant_delete_contentfilteredtopic(
     const dds_DomainParticipant& self, dds_ContentFilteredTopic& topic) {
+	auto lifecycleLock = detail::LockLifecycle(detail::SharedImpl(self));
 	if(!self || !topic) {
 		return detail::BadParameter();
 	}
@@ -1017,6 +1120,7 @@ inline dds_MultiTopic dds_DomainParticipant_create_multitopic(const dds_DomainPa
     const char* typeName,
     const char* subscriptionExpression,
     const ::dds_StringSeq* expressionParameters) {
+	auto lifecycleLock = detail::LockLifecycle(detail::SharedImpl(self));
 	::dds_MultiTopic* raw = ::dds_DomainParticipant_create_multitopic(
 	    static_cast<::dds_DomainParticipant*>(self), name, typeName, subscriptionExpression, expressionParameters);
 	if(raw == nullptr) {
@@ -1027,6 +1131,7 @@ inline dds_MultiTopic dds_DomainParticipant_create_multitopic(const dds_DomainPa
 
 inline ::dds_ReturnCode_t dds_DomainParticipant_delete_multitopic(
     const dds_DomainParticipant& self, dds_MultiTopic& topic) {
+	auto lifecycleLock = detail::LockLifecycle(detail::SharedImpl(self));
 	if(!self || !topic) {
 		return detail::BadParameter();
 	}
@@ -1045,6 +1150,7 @@ inline ::dds_ReturnCode_t dds_DomainParticipant_delete_multitopic(
 // A native entity with no registered owner yields an empty handle; it is never adopted.
 inline dds_DomainParticipant dds_DomainParticipantFactory_lookup_participant(
     ::dds_DomainParticipantFactory* self, ::dds_DomainId_t domainId) {
+	std::lock_guard<std::recursive_mutex> factoryLock(detail::GetFactoryMutex());
 	if(!self)
 		return {};
 	return dds_DomainParticipant(
@@ -1053,13 +1159,34 @@ inline dds_DomainParticipant dds_DomainParticipantFactory_lookup_participant(
 
 inline dds_Topic dds_DomainParticipant_find_topic(
     const dds_DomainParticipant& self, const char* topicName, const ::dds_Duration_t* timeout) {
-	if(!self || !topicName || !timeout)
+	auto lifecycleLock = detail::LockLifecycle(detail::SharedImpl(self));
+	if(!self || !topicName || !timeout || timeout->sec < 0)
 		return {};
-	return dds_Topic(detail::RegisteredOwner<Topic>(::dds_DomainParticipant_find_topic(self, topicName, timeout)));
+	// Preserve the SDK's zero-timeout behavior without entering a blocking SDK find.
+	if(timeout->sec == 0 && timeout->nanosec == 0)
+		return {};
+	const bool infinite = timeout->sec == dds_DURATION_INFINITE_SEC && timeout->nanosec == dds_DURATION_INFINITE_NSEC;
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout->sec) +
+	                      std::chrono::nanoseconds(timeout->nanosec);
+	for(;;) {
+		auto raw = ::dds_DomainParticipant_lookup_topicdescription(self, topicName);
+		auto owner = detail::RegisteredOwner<Topic>(reinterpret_cast<::dds_Topic*>(raw));
+		if(owner)
+			return dds_Topic(std::move(owner));
+		if(infinite) {
+			lifecycleLock.Wait();
+		} else if(std::chrono::steady_clock::now() >= deadline) {
+			return {};
+		} else {
+			// Waiting releases the lifecycle mutex, allowing creation and deletion.
+			lifecycleLock.WaitUntil(deadline);
+		}
+	}
 }
 
 inline dds_TopicDescription dds_DomainParticipant_lookup_topicdescription(
     const dds_DomainParticipant& self, const char* name) {
+	auto lifecycleLock = detail::LockLifecycle(detail::SharedImpl(self));
 	if(!self || !name)
 		return {};
 	return detail::RegisteredDescription(::dds_DomainParticipant_lookup_topicdescription(self, name));
@@ -1067,24 +1194,28 @@ inline dds_TopicDescription dds_DomainParticipant_lookup_topicdescription(
 
 inline dds_TopicDescription dds_DomainParticipant_lookup_topicdescription_w_index(
     const dds_DomainParticipant& self, const char* name, ::dds_UnsignedLong index) {
+	auto lifecycleLock = detail::LockLifecycle(detail::SharedImpl(self));
 	if(!self || !name)
 		return {};
 	return detail::RegisteredDescription(::dds_DomainParticipant_lookup_topicdescription_w_index(self, name, index));
 }
 
 inline dds_DataWriter dds_Publisher_lookup_datawriter(const dds_Publisher& self, const char* topicName) {
+	auto lifecycleLock = detail::LockLifecycle(detail::SharedImpl(self));
 	if(!self || !topicName)
 		return {};
 	return dds_DataWriter(detail::RegisteredOwner<DataWriter>(::dds_Publisher_lookup_datawriter(self, topicName)));
 }
 
 inline dds_DataReader dds_Subscriber_lookup_datareader(const dds_Subscriber& self, const char* topicName) {
+	auto lifecycleLock = detail::LockLifecycle(detail::SharedImpl(self));
 	if(!self || !topicName)
 		return {};
 	return dds_DataReader(detail::RegisteredOwner<DataReader>(::dds_Subscriber_lookup_datareader(self, topicName)));
 }
 
 inline dds_DataWriter dds_Publisher_get_contained_datawriter_by_name(const dds_Publisher& self, char* name) {
+	auto lifecycleLock = detail::LockLifecycle(detail::SharedImpl(self));
 	if(!self || !name)
 		return {};
 	return dds_DataWriter(
@@ -1092,6 +1223,7 @@ inline dds_DataWriter dds_Publisher_get_contained_datawriter_by_name(const dds_P
 }
 
 inline dds_DataReader dds_Subscriber_get_contained_datareader_by_name(const dds_Subscriber& self, char* name) {
+	auto lifecycleLock = detail::LockLifecycle(detail::SharedImpl(self));
 	if(!self || !name)
 		return {};
 	return dds_DataReader(
@@ -1106,6 +1238,7 @@ inline dds_DataWriter dds_Publisher_create_datawriter(const dds_Publisher& self,
     const ::dds_DataWriterQos* qos,
     const ::dds_DataWriterListener* aListener,
     ::dds_StatusMask mask) {
+	auto lifecycleLock = detail::LockLifecycle(detail::SharedImpl(self));
 	::dds_DataWriter* raw = ::dds_Publisher_create_datawriter(
 	    static_cast<::dds_Publisher*>(self), static_cast<::dds_Topic*>(aTopic), qos, aListener, mask);
 	if(raw == nullptr) {
@@ -1121,6 +1254,7 @@ inline dds_DataWriter dds_Publisher_create_datawriter_w_props(const dds_Publishe
     const ::dds_DataWriterListener* aListener,
     ::dds_StatusMask mask,
     ::dds_StringProperty* props) {
+	auto lifecycleLock = detail::LockLifecycle(detail::SharedImpl(self));
 	::dds_DataWriter* raw = ::dds_Publisher_create_datawriter_w_props(
 	    static_cast<::dds_Publisher*>(self), static_cast<::dds_Topic*>(aTopic), qos, aListener, mask, props);
 	if(raw == nullptr) {
@@ -1135,6 +1269,7 @@ inline dds_DataWriter dds_Publisher_create_datawriter_w_profile(const dds_Publis
     const char* profileName,
     const ::dds_DataWriterListener* aListener,
     ::dds_StatusMask mask) {
+	auto lifecycleLock = detail::LockLifecycle(detail::SharedImpl(self));
 	::dds_DataWriter* raw = ::dds_Publisher_create_datawriter_w_profile(
 	    static_cast<::dds_Publisher*>(self), static_cast<::dds_Topic*>(aTopic), profileName, aListener, mask);
 	if(raw == nullptr) {
@@ -1151,6 +1286,7 @@ inline dds_DataWriter dds_Publisher_create_datawriter(const dds_Publisher& self,
     const ::dds_DataWriterQos* qos,
     const ::dds_DataWriterListener* aListener,
     ::dds_StatusMask mask) {
+	auto lifecycleLock = detail::LockLifecycle(detail::SharedImpl(self));
 	::dds_DataWriter* raw =
 	    ::dds_Publisher_create_datawriter(static_cast<::dds_Publisher*>(self), aTopic, qos, aListener, mask);
 	if(raw == nullptr) {
@@ -1166,6 +1302,7 @@ inline dds_DataWriter dds_Publisher_create_datawriter_w_props(const dds_Publishe
     const ::dds_DataWriterListener* aListener,
     ::dds_StatusMask mask,
     ::dds_StringProperty* props) {
+	auto lifecycleLock = detail::LockLifecycle(detail::SharedImpl(self));
 	::dds_DataWriter* raw = ::dds_Publisher_create_datawriter_w_props(
 	    static_cast<::dds_Publisher*>(self), aTopic, qos, aListener, mask, props);
 	if(raw == nullptr) {
@@ -1180,6 +1317,7 @@ inline dds_DataWriter dds_Publisher_create_datawriter_w_profile(const dds_Publis
     const char* profileName,
     const ::dds_DataWriterListener* aListener,
     ::dds_StatusMask mask) {
+	auto lifecycleLock = detail::LockLifecycle(detail::SharedImpl(self));
 	::dds_DataWriter* raw = ::dds_Publisher_create_datawriter_w_profile(
 	    static_cast<::dds_Publisher*>(self), aTopic, profileName, aListener, mask);
 	if(raw == nullptr) {
@@ -1190,6 +1328,7 @@ inline dds_DataWriter dds_Publisher_create_datawriter_w_profile(const dds_Publis
 }
 
 inline ::dds_ReturnCode_t dds_Publisher_delete_datawriter(const dds_Publisher& self, dds_DataWriter& aDatawriter) {
+	auto lifecycleLock = detail::LockLifecycle(detail::SharedImpl(self));
 	if(!self || !aDatawriter) {
 		return detail::BadParameter();
 	}
@@ -1212,6 +1351,7 @@ inline dds_DataReader dds_Subscriber_create_datareader(const dds_Subscriber& sel
     const ::dds_DataReaderQos* qos,
     const ::dds_DataReaderListener* aListener,
     ::dds_StatusMask mask) {
+	auto lifecycleLock = detail::LockLifecycle(detail::SharedImpl(self));
 	::dds_DataReader* raw = ::dds_Subscriber_create_datareader(static_cast<::dds_Subscriber*>(self),
 	    detail::TopicDescriptionCast(static_cast<::dds_Topic*>(aTopic)),
 	    qos,
@@ -1229,6 +1369,7 @@ inline dds_DataReader dds_Subscriber_create_datareader(const dds_Subscriber& sel
     const ::dds_DataReaderQos* qos,
     const ::dds_DataReaderListener* aListener,
     ::dds_StatusMask mask) {
+	auto lifecycleLock = detail::LockLifecycle(detail::SharedImpl(self));
 	::dds_DataReader* raw = ::dds_Subscriber_create_datareader(static_cast<::dds_Subscriber*>(self),
 	    detail::TopicDescriptionCast(static_cast<::dds_ContentFilteredTopic*>(aTopic)),
 	    qos,
@@ -1246,6 +1387,7 @@ inline dds_DataReader dds_Subscriber_create_datareader(const dds_Subscriber& sel
     const ::dds_DataReaderQos* qos,
     const ::dds_DataReaderListener* aListener,
     ::dds_StatusMask mask) {
+	auto lifecycleLock = detail::LockLifecycle(detail::SharedImpl(self));
 	::dds_DataReader* raw = ::dds_Subscriber_create_datareader(static_cast<::dds_Subscriber*>(self),
 	    detail::TopicDescriptionCast(static_cast<::dds_MultiTopic*>(aTopic)),
 	    qos,
@@ -1263,6 +1405,7 @@ inline dds_DataReader dds_Subscriber_create_datareader_w_profile(const dds_Subsc
     const char* profileName,
     const ::dds_DataReaderListener* aListener,
     ::dds_StatusMask mask) {
+	auto lifecycleLock = detail::LockLifecycle(detail::SharedImpl(self));
 	::dds_DataReader* raw = ::dds_Subscriber_create_datareader_w_profile(
 	    static_cast<::dds_Subscriber*>(self), static_cast<::dds_Topic*>(aTopic), profileName, aListener, mask);
 	if(raw == nullptr) {
@@ -1277,6 +1420,7 @@ inline dds_DataReader dds_Subscriber_create_datareader(const dds_Subscriber& sel
     const ::dds_DataReaderQos* qos,
     const ::dds_DataReaderListener* aListener,
     ::dds_StatusMask mask) {
+	auto lifecycleLock = detail::LockLifecycle(detail::SharedImpl(self));
 	::dds_DataReader* raw = ::dds_Subscriber_create_datareader(self, aTopic.get(), qos, aListener, mask);
 	if(!raw)
 		return {};
@@ -1289,6 +1433,7 @@ inline dds_DataReader dds_Subscriber_create_datareader(const dds_Subscriber& sel
     const ::dds_DataReaderQos* qos,
     const ::dds_DataReaderListener* aListener,
     ::dds_StatusMask mask) {
+	auto lifecycleLock = detail::LockLifecycle(detail::SharedImpl(self));
 	::dds_DataReader* raw =
 	    ::dds_Subscriber_create_datareader(static_cast<::dds_Subscriber*>(self), aTopic, qos, aListener, mask);
 	if(raw == nullptr) {
@@ -1318,6 +1463,7 @@ inline dds_DataReader dds_Subscriber_create_datareader_w_profile(const dds_Subsc
     const char* profileName,
     const ::dds_DataReaderListener* aListener,
     ::dds_StatusMask mask) {
+	auto lifecycleLock = detail::LockLifecycle(detail::SharedImpl(self));
 	::dds_DataReader* raw = ::dds_Subscriber_create_datareader_w_profile(
 	    static_cast<::dds_Subscriber*>(self), aTopic, profileName, aListener, mask);
 	if(raw == nullptr) {
@@ -1328,6 +1474,7 @@ inline dds_DataReader dds_Subscriber_create_datareader_w_profile(const dds_Subsc
 }
 
 inline ::dds_ReturnCode_t dds_Subscriber_delete_datareader(const dds_Subscriber& self, dds_DataReader& aDatareader) {
+	auto lifecycleLock = detail::LockLifecycle(detail::SharedImpl(self));
 	if(!self || !aDatareader) {
 		return detail::BadParameter();
 	}
