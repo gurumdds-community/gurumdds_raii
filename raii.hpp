@@ -306,9 +306,8 @@ std::shared_ptr<TImpl> RegisteredOwner(TRaw* raw) {
 	return owner;
 }
 
-template <typename TImpl, typename TRaw, typename... TArgs>
-std::shared_ptr<TImpl> MakeRegisteredOwned(TRaw* raw, const TArgs&... args) {
-	auto owner = MakeOwned<TImpl>(raw, args...);
+template <typename TImpl, typename TRaw>
+void RegisterOwner(TRaw* raw, const std::shared_ptr<TImpl>& owner) {
 	auto& registry = GetOwnerRegistry<TImpl>();
 	std::lock_guard<std::mutex> lock(registry.m_mutex);
 	// Remove expired control blocks so repeated create/delete does not grow it.
@@ -319,6 +318,12 @@ std::shared_ptr<TImpl> MakeRegisteredOwned(TRaw* raw, const TArgs&... args) {
 			++it;
 	}
 	registry.m_owners[raw] = owner;
+}
+
+template <typename TImpl, typename TRaw, typename... TArgs>
+std::shared_ptr<TImpl> MakeRegisteredOwned(TRaw* raw, const TArgs&... args) {
+	auto owner = MakeOwned<TImpl>(raw, args...);
+	RegisterOwner(raw, owner);
 	NotifyLifecycle(GetParticipant(owner));
 	return owner;
 }
@@ -1640,17 +1645,24 @@ inline ::dds_ReturnCode_t dds_WaitSet_detach_condition(const dds_WaitSet& self, 
 	return detail::SharedImpl(self)->detach(cond);
 }
 
+namespace detail {
+struct DynamicDataAccess;
+}
+
 // Move-only owners for sequences, TypeSupport, samples, and dynamic types.
 // Deleters return the native return code. Destructor failures terminate, matching
 // the entity wrappers; use close()/the explicit delete wrapper to inspect errors.
 template <typename TValue, typename TDeleter>
 class Resource {
+	friend struct detail::DynamicDataAccess;
+
 	struct State {
 		TValue* m_raw = nullptr;
 		TDeleter m_deleter;
 		std::function<::dds_ReturnCode_t()> m_beforeDelete;
 		const void* m_loanIdentity = nullptr;
 		const void* m_loanReader = nullptr;
+		detail::OwnerRegistry<State>* m_registry{nullptr};
 
 		explicit State(TDeleter d)
 		    : m_deleter(std::move(d)) {
@@ -1663,9 +1675,47 @@ class Resource {
 				detail::TerminateOnError(m_deleter(m_raw), "RAII resource cleanup");
 			}
 		}
+
+		TValue* operator*() const noexcept {
+			return m_raw;
+		}
 	};
 
 	std::shared_ptr<State> m_state;
+
+	std::unique_lock<std::mutex> LockOwnerRegistry() const {
+		if(!m_state->m_registry)
+			return {};
+		return std::unique_lock<std::mutex>{m_state->m_registry->m_mutex};
+	}
+
+	void ClearRaw() noexcept {
+		if(m_state->m_registry)
+			m_state->m_registry->m_owners.erase(m_state->m_raw);
+		m_state->m_raw = nullptr;
+	}
+
+	template <typename TCleanup>
+	::dds_ReturnCode_t CloseWith(TCleanup cleanup) noexcept {
+		if(!get())
+			return dds_RETCODE_OK;
+
+		{
+			// Lock the registry so lookup cannot acquire a pointer during explicit cleanup.
+			auto lock{LockOwnerRegistry()};
+			if(m_state.use_count() != 1)
+				return dds_RETCODE_PRECONDITION_NOT_MET;
+			const auto loanRet{finish_loan()};
+			if(loanRet != dds_RETCODE_OK)
+				return loanRet;
+			const auto ret{cleanup(m_state->m_raw)};
+			if(ret != dds_RETCODE_OK)
+				return ret;
+			ClearRaw();
+		}
+		m_state.reset();
+		return dds_RETCODE_OK;
+	}
 
 public:
 	using native_type = TValue;
@@ -1779,28 +1829,20 @@ public:
 			return nullptr;
 		if(m_state->m_beforeDelete)
 			throw std::logic_error("Return the sequence loan before release()");
-		if(m_state.use_count() != 1)
-			throw std::logic_error("DDS resource is still in use");
-		TValue* raw = m_state->m_raw;
-		m_state->m_raw = nullptr;
+		TValue* raw{};
+		{
+			auto lock{LockOwnerRegistry()};
+			if(m_state.use_count() != 1)
+				throw std::logic_error("DDS resource is still in use");
+			raw = m_state->m_raw;
+			ClearRaw();
+		}
 		m_state.reset();
 		return raw;
 	}
 
 	::dds_ReturnCode_t close() noexcept {
-		if(!get())
-			return dds_RETCODE_OK;
-		if(m_state.use_count() != 1)
-			return dds_RETCODE_PRECONDITION_NOT_MET;
-		const auto loanRet = finish_loan();
-		if(loanRet != dds_RETCODE_OK)
-			return loanRet;
-		const auto ret = m_state->m_deleter(m_state->m_raw);
-		if(ret == dds_RETCODE_OK) {
-			m_state->m_raw = nullptr;
-			m_state.reset();
-		}
-		return ret;
+		return CloseWith([this](TValue* raw) { return m_state->m_deleter(raw); });
 	}
 
 	template <typename TAllocate>
@@ -1961,7 +2003,7 @@ RAII_SEQUENCE_DEFINE(dds_KeyedBytesSeq)
 		return ::qos_type##_copy(dst, src);                                                                            \
 	}
 
-// RAII Qos 매크로 확장
+// Expand the RAII QoS macros.
 RAII_QOS_DEFINE(dds_DomainParticipantFactoryQos)
 RAII_QOS_DEFINE(dds_DomainParticipantQos)
 RAII_QOS_DEFINE(dds_TopicQos)
@@ -2189,18 +2231,43 @@ struct dds_DynamicData_deleter {
 
 using dds_DynamicData = Resource<::dds_DynamicData, dds_DynamicData_deleter>;
 
+namespace detail {
+struct DynamicDataAccess {
+	template <typename TAllocate>
+	static dds_DynamicData Create(TAllocate allocate, dds_DynamicData_deleter deleter = {}) {
+		auto data{dds_DynamicData::create(std::move(allocate), std::move(deleter))};
+		if(data) {
+			data.m_state->m_registry = &GetOwnerRegistry<dds_DynamicData::State>();
+			RegisterOwner(data.get(), data.m_state);
+		}
+		return data;
+	}
+
+	static dds_DynamicData Lookup(::dds_DynamicData* raw) {
+		dds_DynamicData data;
+		data.m_state = RegisteredOwner<dds_DynamicData::State>(raw);
+		return data;
+	}
+
+	static ::dds_ReturnCode_t Delete(::dds_DynamicDataFactory* factory, dds_DynamicData& data) noexcept {
+		return data.CloseWith(
+		    [factory](::dds_DynamicData* raw) { return ::dds_DynamicDataFactory_delete_data(factory, raw); });
+	}
+};
+} // namespace detail
+
+// Shares ownership of data registered by the RAII creation and clone functions.
+inline dds_DynamicData dds_DynamicData_lookup(::dds_DynamicData* raw) {
+	return detail::DynamicDataAccess::Lookup(raw);
+}
+
 inline ::dds_ReturnCode_t dds_DynamicDataFactory_delete_data(
     ::dds_DynamicDataFactory* self, dds_DynamicData& data) noexcept {
 	if(!data)
 		return dds_RETCODE_BAD_PARAMETER;
 	if(data.deleter()->parent)
 		return dds_RETCODE_PRECONDITION_NOT_MET;
-	if(data.owner().use_count() > 2)
-		return dds_RETCODE_PRECONDITION_NOT_MET;
-	const auto ret = ::dds_DynamicDataFactory_delete_data(self, data.get());
-	if(ret == dds_RETCODE_OK)
-		(void)data.release();
-	return ret;
+	return detail::DynamicDataAccess::Delete(self, data);
 }
 
 inline dds_DynamicData dds_DynamicData_loan_value(const dds_DynamicData& self, ::dds_MemberId_t id) {
@@ -2268,12 +2335,12 @@ inline dds_DynamicTypeSupport dds_DynamicTypeSupport_create_type_support(::dds_D
 
 inline dds_DynamicData dds_DynamicDataFactory_create_data(
     ::dds_DynamicDataFactory* self, const ::dds_DynamicType* type) {
-	return dds_DynamicData::create(
+	return detail::DynamicDataAccess::Create(
 	    [&]() { return ::dds_DynamicDataFactory_create_data(self, type); }, dds_DynamicData_deleter(self));
 }
 
 inline dds_DynamicData dds_DynamicData_clone(::dds_DynamicData* self) {
-	return dds_DynamicData::create([&]() { return ::dds_DynamicData_clone(self); });
+	return detail::DynamicDataAccess::Create([&]() { return ::dds_DynamicData_clone(self); });
 }
 
 // The C DynamicData implementation borrows its type, including in clones.
@@ -2281,13 +2348,13 @@ inline dds_DynamicData dds_DynamicDataFactory_create_data(::dds_DynamicDataFacto
 	dds_DynamicData_deleter cleanup(self);
 	cleanup.type_owner = type.owner();
 
-	return dds_DynamicData::create([&]() { return ::dds_DynamicDataFactory_create_data(self, type); }, cleanup);
+	return detail::DynamicDataAccess::Create([&]() { return ::dds_DynamicDataFactory_create_data(self, type); }, cleanup);
 }
 
 inline dds_DynamicData dds_DynamicData_clone(const dds_DynamicData& self) {
 	dds_DynamicData_deleter cleanup;
 	cleanup.type_owner = self.owner();
-	return dds_DynamicData::create([&]() { return ::dds_DynamicData_clone(self); }, cleanup);
+	return detail::DynamicDataAccess::Create([&]() { return ::dds_DynamicData_clone(self); }, cleanup);
 }
 
 inline dds_TypeSupport dds_TypeSupport_create(const char* metaStr) {
