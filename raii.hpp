@@ -612,7 +612,7 @@ public:
 		return m_kind == Kind::Multi ? dds_MultiTopic(std::static_pointer_cast<MultiTopic>(m_owner)) : dds_MultiTopic{};
 	}
 
-	const std::shared_ptr<void>& owner() const noexcept {
+	const std::shared_ptr<void>& GetOwner() const noexcept {
 		return m_owner;
 	}
 
@@ -828,7 +828,7 @@ public:
 	};
 
 	template <typename TC>
-	::dds_ReturnCode_t attach(const TC& condition) {
+	::dds_ReturnCode_t Attach(const TC& condition) {
 		auto raw = detail::ConditionCast(condition.get());
 		for(const auto& item : m_attached) {
 			if(item.raw == raw)
@@ -842,7 +842,7 @@ public:
 	}
 
 	template <typename TC>
-	::dds_ReturnCode_t detach(const TC& condition) {
+	::dds_ReturnCode_t Detach(const TC& condition) {
 		auto raw = detail::ConditionCast(condition.get());
 		const auto ret = ::dds_WaitSet_detach_condition(m_entity, raw);
 		if(ret == dds_RETCODE_OK) {
@@ -854,7 +854,7 @@ public:
 		return ret;
 	}
 
-	void clear_attachments() noexcept {
+	void ClearAttachments() noexcept {
 		m_attached.clear();
 	}
 
@@ -1429,7 +1429,7 @@ inline dds_DataReader dds_Subscriber_create_datareader(const dds_Subscriber& sel
 	::dds_DataReader* raw = ::dds_Subscriber_create_datareader(self, aTopic.get(), qos, aListener, mask);
 	if(!raw)
 		return {};
-	return dds_DataReader(detail::MakeRegisteredOwned<DataReader>(raw, detail::SharedImpl(self), aTopic.owner()));
+	return dds_DataReader(detail::MakeRegisteredOwned<DataReader>(raw, detail::SharedImpl(self), aTopic.GetOwner()));
 }
 
 // Raw topic descriptions are borrowed; no C++ topic owner is retained.
@@ -1576,7 +1576,7 @@ inline ::dds_ReturnCode_t dds_WaitSet_delete(dds_WaitSet& self) {
 	::dds_ReturnCode_t ret = ::dds_WaitSet_delete(self);
 	if(ret == dds_RETCODE_OK) {
 		*detail::SharedImpl(self) = nullptr;
-		detail::SharedImpl(self)->clear_attachments();
+		detail::SharedImpl(self)->ClearAttachments();
 		self = nullptr;
 	}
 	return ret;
@@ -1607,42 +1607,42 @@ inline ::dds_ReturnCode_t dds_WaitSet_attach_condition(const dds_WaitSet& self, 
 	if(!self || !cond) {
 		return detail::BadParameter();
 	}
-	return detail::SharedImpl(self)->attach(cond);
+	return detail::SharedImpl(self)->Attach(cond);
 }
 
 inline ::dds_ReturnCode_t dds_WaitSet_attach_condition(const dds_WaitSet& self, const dds_ReadCondition& cond) {
 	if(!self || !cond) {
 		return detail::BadParameter();
 	}
-	return detail::SharedImpl(self)->attach(cond);
+	return detail::SharedImpl(self)->Attach(cond);
 }
 
 inline ::dds_ReturnCode_t dds_WaitSet_attach_condition(const dds_WaitSet& self, const dds_QueryCondition& cond) {
 	if(!self || !cond) {
 		return detail::BadParameter();
 	}
-	return detail::SharedImpl(self)->attach(cond);
+	return detail::SharedImpl(self)->Attach(cond);
 }
 
 inline ::dds_ReturnCode_t dds_WaitSet_detach_condition(const dds_WaitSet& self, const dds_GuardCondition& cond) {
 	if(!self || !cond) {
 		return detail::BadParameter();
 	}
-	return detail::SharedImpl(self)->detach(cond);
+	return detail::SharedImpl(self)->Detach(cond);
 }
 
 inline ::dds_ReturnCode_t dds_WaitSet_detach_condition(const dds_WaitSet& self, const dds_ReadCondition& cond) {
 	if(!self || !cond) {
 		return detail::BadParameter();
 	}
-	return detail::SharedImpl(self)->detach(cond);
+	return detail::SharedImpl(self)->Detach(cond);
 }
 
 inline ::dds_ReturnCode_t dds_WaitSet_detach_condition(const dds_WaitSet& self, const dds_QueryCondition& cond) {
 	if(!self || !cond) {
 		return detail::BadParameter();
 	}
-	return detail::SharedImpl(self)->detach(cond);
+	return detail::SharedImpl(self)->Detach(cond);
 }
 
 namespace detail {
@@ -1705,7 +1705,7 @@ class Resource {
 			auto lock{LockOwnerRegistry()};
 			if(m_state.use_count() != 1)
 				return dds_RETCODE_PRECONDITION_NOT_MET;
-			const auto loanRet{finish_loan()};
+			const auto loanRet{FinishLoan()};
 			if(loanRet != dds_RETCODE_OK)
 				return loanRet;
 			const auto ret{cleanup(m_state->m_raw)};
@@ -1779,11 +1779,11 @@ public:
 		return get() != nullptr;
 	}
 
-	std::shared_ptr<void> owner() const noexcept {
+	std::shared_ptr<void> GetOwner() const noexcept {
 		return m_state;
 	}
 
-	const TDeleter* deleter() const noexcept {
+	const TDeleter* GetDeleter() const noexcept {
 		return m_state ? &m_state->m_deleter : nullptr;
 	}
 
@@ -1791,7 +1791,7 @@ public:
 		m_state.reset();
 	}
 
-	::dds_ReturnCode_t finish_loan() noexcept {
+	::dds_ReturnCode_t FinishLoan() noexcept {
 		if(!m_state || !m_state->m_beforeDelete)
 			return dds_RETCODE_OK;
 		const auto ret = m_state->m_beforeDelete();
@@ -1803,11 +1803,11 @@ public:
 		return ret;
 	}
 
-	::dds_ReturnCode_t prepare_loan(
+	::dds_ReturnCode_t PrepareLoan(
 	    std::function<::dds_ReturnCode_t()> cleanup, const void* identity = nullptr, const void* reader = nullptr) {
 		if(!get())
 			return dds_RETCODE_BAD_PARAMETER;
-		const auto ret = finish_loan();
+		const auto ret = FinishLoan();
 		if(ret != dds_RETCODE_OK)
 			return ret;
 		m_state->m_beforeDelete = std::move(cleanup);
@@ -1816,11 +1816,11 @@ public:
 		return dds_RETCODE_OK;
 	}
 
-	const void* loan_identity() const noexcept {
+	const void* GetLoanIdentity() const noexcept {
 		return m_state ? m_state->m_loanIdentity : nullptr;
 	}
 
-	const void* loan_reader() const noexcept {
+	const void* GetLoanReader() const noexcept {
 		return m_state ? m_state->m_loanReader : nullptr;
 	}
 
@@ -1846,7 +1846,7 @@ public:
 	}
 
 	template <typename TAllocate>
-	static Resource create(TAllocate allocate, TDeleter deleter = TDeleter()) {
+	static Resource Create(TAllocate allocate, TDeleter deleter = TDeleter()) {
 		Resource result;
 		result.m_state = std::make_shared<State>(std::move(deleter));
 		result.m_state->m_raw = allocate(); // No throwing C++ work after allocation.
@@ -1869,13 +1869,13 @@ public:
 	};                                                                                                                 \
 	using Type = ::raii::Resource<::Type, TypeSupport##_sample_deleter>;                                               \
 	inline Type TypeSupport##_alloc() {                                                                                \
-		return Type::create([]() { return ::TypeSupport##_alloc(); });                                                 \
+		return Type::Create([]() { return ::TypeSupport##_alloc(); });                                                 \
 	}                                                                                                                  \
 	inline void TypeSupport##_free(Type& sample) noexcept {                                                            \
 		sample.reset();                                                                                                \
 	}                                                                                                                  \
 	inline Type TypeSupport##_deserialize(void* input, size_t input_size) {                                            \
-		return Type::create([&]() { return ::TypeSupport##_deserialize(input, input_size); });                         \
+		return Type::Create([&]() { return ::TypeSupport##_deserialize(input, input_size); });                         \
 	}                                                                                                                  \
 	}
 
@@ -1888,10 +1888,10 @@ public:
 	};                                                                                                                 \
 	using seq_type = Resource<::seq_type, seq_type##_deleter>;                                                         \
 	inline seq_type seq_type##_create(uint32_t capacity) {                                                             \
-		return seq_type::create([=]() { return ::seq_type##_create(capacity); });                                      \
+		return seq_type::Create([=]() { return ::seq_type##_create(capacity); });                                      \
 	}                                                                                                                  \
 	inline seq_type seq_type##_clone(::seq_type* sequence) {                                                           \
-		return seq_type::create([=]() { return ::seq_type##_clone(sequence); });                                       \
+		return seq_type::Create([=]() { return ::seq_type##_clone(sequence); });                                       \
 	}                                                                                                                  \
 	inline void seq_type##_delete(seq_type& sequence) noexcept {                                                       \
 		sequence.reset();                                                                                              \
@@ -2203,7 +2203,7 @@ inline ::dds_ReturnCode_t dds_DynamicTypeBuilderFactory_delete_type(
     ::dds_DynamicTypeBuilderFactory* self, dds_DynamicType& type) noexcept {
 	if(!type)
 		return dds_RETCODE_OK;
-	if(type.owner().use_count() > 2)
+	if(type.GetOwner().use_count() > 2)
 		return dds_RETCODE_PRECONDITION_NOT_MET;
 	const auto ret = ::dds_DynamicTypeBuilderFactory_delete_type(self, type.get());
 	if(ret == dds_RETCODE_OK)
@@ -2235,7 +2235,7 @@ namespace detail {
 struct DynamicDataAccess {
 	template <typename TAllocate>
 	static dds_DynamicData Create(TAllocate allocate, dds_DynamicData_deleter deleter = {}) {
-		auto data{dds_DynamicData::create(std::move(allocate), std::move(deleter))};
+		auto data{dds_DynamicData::Create(std::move(allocate), std::move(deleter))};
 		if(data) {
 			data.m_state->m_registry = &GetOwnerRegistry<dds_DynamicData::State>();
 			RegisterOwner(data.get(), data.m_state);
@@ -2256,7 +2256,7 @@ struct DynamicDataAccess {
 		dds_DynamicData_deleter cleanup;
 		cleanup.parent = parent;
 		cleanup.parent_owner = std::move(parentOwner);
-		return dds_DynamicData::create(
+		return dds_DynamicData::Create(
 		    [&]() { return ::dds_DynamicData_loan_value(parent, id); }, std::move(cleanup));
 	}
 
@@ -2276,28 +2276,28 @@ inline ::dds_ReturnCode_t dds_DynamicDataFactory_delete_data(
     ::dds_DynamicDataFactory* self, dds_DynamicData& data) noexcept {
 	if(!data)
 		return dds_RETCODE_BAD_PARAMETER;
-	if(data.deleter()->parent)
+	if(data.GetDeleter()->parent)
 		return dds_RETCODE_PRECONDITION_NOT_MET;
 	return detail::DynamicDataAccess::Delete(self, data);
 }
 
 inline dds_DynamicData dds_DynamicData_loan_value(const dds_DynamicData& self, ::dds_MemberId_t id) {
-	return detail::DynamicDataAccess::Loan(self.get(), id, self.owner());
+	return detail::DynamicDataAccess::Loan(self.get(), id, self.GetOwner());
 }
 
 // Pass a live parent. If it has no registered owner, keep it alive until the loan is returned.
 inline dds_DynamicData dds_DynamicData_loan_value(::dds_DynamicData* self, ::dds_MemberId_t id) {
 	auto parent{dds_DynamicData_lookup(self)};
-	return detail::DynamicDataAccess::Loan(self, id, parent.owner());
+	return detail::DynamicDataAccess::Loan(self, id, parent.GetOwner());
 }
 
 inline ::dds_ReturnCode_t dds_DynamicData_return_loaned_value(
     const dds_DynamicData& self, dds_DynamicData& value) noexcept {
 	if(!self || !value)
 		return dds_RETCODE_BAD_PARAMETER;
-	if(value.deleter()->parent != self.get())
+	if(value.GetDeleter()->parent != self.get())
 		return dds_RETCODE_PRECONDITION_NOT_MET;
-	if(value.owner().use_count() > 2)
+	if(value.GetOwner().use_count() > 2)
 		return dds_RETCODE_PRECONDITION_NOT_MET;
 	const auto ret = ::dds_DynamicData_return_loaned_value(self, value.get());
 	if(ret == dds_RETCODE_OK)
@@ -2324,27 +2324,27 @@ inline void dds_free(dds_String& value) noexcept {
 }
 
 inline dds_Memory dds_malloc(size_t size) {
-	return dds_Memory::create([=]() { return ::dds_malloc(size); });
+	return dds_Memory::Create([=]() { return ::dds_malloc(size); });
 }
 
 inline dds_Memory dds_calloc(size_t count, size_t size) {
-	return dds_Memory::create([=]() { return ::dds_calloc(count, size); });
+	return dds_Memory::Create([=]() { return ::dds_calloc(count, size); });
 }
 
 inline dds_String dds_strdup(const char* str) {
-	return dds_String::create([=]() { return ::dds_strdup(str); });
+	return dds_String::Create([=]() { return ::dds_strdup(str); });
 }
 
 inline dds_DynamicType dds_DynamicTypeBuilder_build(::dds_DynamicTypeBuilder* self) {
-	return dds_DynamicType::create([&]() { return ::dds_DynamicTypeBuilder_build(self); });
+	return dds_DynamicType::Create([&]() { return ::dds_DynamicTypeBuilder_build(self); });
 }
 
 inline dds_DynamicTypeMember dds_DynamicTypeMember_alloc() {
-	return dds_DynamicTypeMember::create([&]() { return ::dds_DynamicTypeMember_alloc(); });
+	return dds_DynamicTypeMember::Create([&]() { return ::dds_DynamicTypeMember_alloc(); });
 }
 
 inline dds_DynamicTypeSupport dds_DynamicTypeSupport_create_type_support(::dds_DynamicType* type) {
-	return dds_DynamicTypeSupport::create([&]() { return ::dds_DynamicTypeSupport_create_type_support(type); });
+	return dds_DynamicTypeSupport::Create([&]() { return ::dds_DynamicTypeSupport_create_type_support(type); });
 }
 
 inline dds_DynamicData dds_DynamicDataFactory_create_data(
@@ -2360,137 +2360,137 @@ inline dds_DynamicData dds_DynamicData_clone(::dds_DynamicData* self) {
 // The C DynamicData implementation borrows its type, including in clones.
 inline dds_DynamicData dds_DynamicDataFactory_create_data(::dds_DynamicDataFactory* self, const dds_DynamicType& type) {
 	dds_DynamicData_deleter cleanup(self);
-	cleanup.type_owner = type.owner();
+	cleanup.type_owner = type.GetOwner();
 
 	return detail::DynamicDataAccess::Create([&]() { return ::dds_DynamicDataFactory_create_data(self, type); }, cleanup);
 }
 
 inline dds_DynamicData dds_DynamicData_clone(const dds_DynamicData& self) {
 	dds_DynamicData_deleter cleanup;
-	cleanup.type_owner = self.owner();
+	cleanup.type_owner = self.GetOwner();
 	return detail::DynamicDataAccess::Create([&]() { return ::dds_DynamicData_clone(self); }, cleanup);
 }
 
 inline dds_TypeSupport dds_TypeSupport_create(const char* metaStr) {
-	return dds_TypeSupport::create([&]() { return ::dds_TypeSupport_create(metaStr); });
+	return dds_TypeSupport::Create([&]() { return ::dds_TypeSupport_create(metaStr); });
 }
 
 inline dds_TypeSupport dds_TypeSupport_create2(const char** metaStrArray, uint32_t metaStrArrayLen) {
-	return dds_TypeSupport::create([&]() { return ::dds_TypeSupport_create2(metaStrArray, metaStrArrayLen); });
+	return dds_TypeSupport::Create([&]() { return ::dds_TypeSupport_create2(metaStrArray, metaStrArrayLen); });
 }
 
 inline dds_TypeSupport dds_TypeSupport_early_create(const char* metaStr) {
-	return dds_TypeSupport::create([&]() { return ::dds_TypeSupport_early_create(metaStr); });
+	return dds_TypeSupport::Create([&]() { return ::dds_TypeSupport_early_create(metaStr); });
 }
 
 inline dds_TypeSupport dds_TypeSupport_early_create2(const char** metaStrArray, uint32_t metaStrArrayLen) {
-	return dds_TypeSupport::create([&]() { return ::dds_TypeSupport_early_create2(metaStrArray, metaStrArrayLen); });
+	return dds_TypeSupport::Create([&]() { return ::dds_TypeSupport_early_create2(metaStrArray, metaStrArrayLen); });
 }
 
 inline dds_Memory dds_TypeSupport_serialize(::dds_TypeSupport* self, void* data, size_t* outputSize) {
-	return dds_Memory::create([&]() { return ::dds_TypeSupport_serialize(self, data, outputSize); });
+	return dds_Memory::Create([&]() { return ::dds_TypeSupport_serialize(self, data, outputSize); });
 }
 
 inline dds_Memory dds_TypeSupport_serialize_w_repr_id(
     ::dds_TypeSupport* self, void* data, size_t* outputSize, dds_DataRepresentationId_t reprId) {
-	return dds_Memory::create([&]() { return ::dds_TypeSupport_serialize_w_repr_id(self, data, outputSize, reprId); });
+	return dds_Memory::Create([&]() { return ::dds_TypeSupport_serialize_w_repr_id(self, data, outputSize, reprId); });
 }
 
 inline dds_Memory dds_StringTypeSupport_serialize(::dds_String data, size_t* outputSize) {
-	return dds_Memory::create([&]() { return ::dds_StringTypeSupport_serialize(data, outputSize); });
+	return dds_Memory::Create([&]() { return ::dds_StringTypeSupport_serialize(data, outputSize); });
 }
 
 inline dds_KeyedString dds_KeyedStringTypeSupport_alloc() {
-	return dds_KeyedString::create([&]() { return ::dds_KeyedStringTypeSupport_alloc(); });
+	return dds_KeyedString::Create([&]() { return ::dds_KeyedStringTypeSupport_alloc(); });
 }
 
 inline dds_Memory dds_KeyedStringTypeSupport_serialize(::dds_KeyedString* data, size_t* outputSize) {
-	return dds_Memory::create([&]() { return ::dds_KeyedStringTypeSupport_serialize(data, outputSize); });
+	return dds_Memory::Create([&]() { return ::dds_KeyedStringTypeSupport_serialize(data, outputSize); });
 }
 
 inline dds_KeyedString dds_KeyedStringTypeSupport_deserialize(void* input, size_t inputSize) {
-	return dds_KeyedString::create([&]() { return ::dds_KeyedStringTypeSupport_deserialize(input, inputSize); });
+	return dds_KeyedString::Create([&]() { return ::dds_KeyedStringTypeSupport_deserialize(input, inputSize); });
 }
 
 inline dds_Bytes dds_BytesTypeSupport_alloc() {
-	return dds_Bytes::create([&]() { return ::dds_BytesTypeSupport_alloc(); });
+	return dds_Bytes::Create([&]() { return ::dds_BytesTypeSupport_alloc(); });
 }
 
 inline dds_Memory dds_BytesTypeSupport_serialize(::dds_Bytes* data, size_t* outputSize) {
-	return dds_Memory::create([&]() { return ::dds_BytesTypeSupport_serialize(data, outputSize); });
+	return dds_Memory::Create([&]() { return ::dds_BytesTypeSupport_serialize(data, outputSize); });
 }
 
 inline dds_Bytes dds_BytesTypeSupport_deserialize(void* input, size_t inputSize) {
-	return dds_Bytes::create([&]() { return ::dds_BytesTypeSupport_deserialize(input, inputSize); });
+	return dds_Bytes::Create([&]() { return ::dds_BytesTypeSupport_deserialize(input, inputSize); });
 }
 
 inline dds_KeyedBytes dds_KeyedBytesTypeSupport_alloc() {
-	return dds_KeyedBytes::create([&]() { return ::dds_KeyedBytesTypeSupport_alloc(); });
+	return dds_KeyedBytes::Create([&]() { return ::dds_KeyedBytesTypeSupport_alloc(); });
 }
 
 inline dds_Memory dds_KeyedBytesTypeSupport_serialize(::dds_KeyedBytes* data, size_t* outputSize) {
-	return dds_Memory::create([&]() { return ::dds_KeyedBytesTypeSupport_serialize(data, outputSize); });
+	return dds_Memory::Create([&]() { return ::dds_KeyedBytesTypeSupport_serialize(data, outputSize); });
 }
 
 inline dds_KeyedBytes dds_KeyedBytesTypeSupport_deserialize(void* input, size_t inputSize) {
-	return dds_KeyedBytes::create([&]() { return ::dds_KeyedBytesTypeSupport_deserialize(input, inputSize); });
+	return dds_KeyedBytes::Create([&]() { return ::dds_KeyedBytesTypeSupport_deserialize(input, inputSize); });
 }
 
 inline dds_String dds_DomainParticipantFactory_dump_as_string(::dds_DomainParticipantFactory* self) {
-	return dds_String::create([&]() { return ::dds_DomainParticipantFactory_dump_as_string(self); });
+	return dds_String::Create([&]() { return ::dds_DomainParticipantFactory_dump_as_string(self); });
 }
 
 inline dds_TypeSupport dds_TypeSupport_raw_create() {
-	return dds_TypeSupport::create([&]() { return ::dds_TypeSupport_raw_create(); });
+	return dds_TypeSupport::Create([&]() { return ::dds_TypeSupport_raw_create(); });
 }
 
 inline dds_TypeSupport dds_TypeSupport_raw_create_w_key() {
-	return dds_TypeSupport::create([&]() { return ::dds_TypeSupport_raw_create_w_key(); });
+	return dds_TypeSupport::Create([&]() { return ::dds_TypeSupport_raw_create_w_key(); });
 }
 
 inline dds_TypeSupport dds_TypeSupport_raw_create_w_typehash(void* typehash, bool hasKey) {
-	return dds_TypeSupport::create([&]() { return ::dds_TypeSupport_raw_create_w_typehash(typehash, hasKey); });
+	return dds_TypeSupport::Create([&]() { return ::dds_TypeSupport_raw_create_w_typehash(typehash, hasKey); });
 }
 
 inline dds_Memory dds_TypeSupport_serialize_be(::dds_TypeSupport* self, void* data, size_t* outputSize) {
-	return dds_Memory::create([&]() { return ::dds_TypeSupport_serialize_be(self, data, outputSize); });
+	return dds_Memory::Create([&]() { return ::dds_TypeSupport_serialize_be(self, data, outputSize); });
 }
 
 inline dds_Memory dds_TypeSupport_serialize_le(::dds_TypeSupport* self, void* data, size_t* outputSize) {
-	return dds_Memory::create([&]() { return ::dds_TypeSupport_serialize_le(self, data, outputSize); });
+	return dds_Memory::Create([&]() { return ::dds_TypeSupport_serialize_le(self, data, outputSize); });
 }
 
 inline dds_String dds_TypeSupport_extract_metastring(::dds_TypeSupport* self) {
-	return dds_String::create([&]() { return ::dds_TypeSupport_extract_metastring(self); });
+	return dds_String::Create([&]() { return ::dds_TypeSupport_extract_metastring(self); });
 }
 
 inline dds_DynamicTypeSupport dds_DynamicTypeSupport_create_type_support_with_metastring(char* metastring) {
-	return dds_DynamicTypeSupport::create(
+	return dds_DynamicTypeSupport::Create(
 	    [&]() { return ::dds_DynamicTypeSupport_create_type_support_with_metastring(metastring); });
 }
 
 inline dds_String dds_DomainParticipantQos_dump_as_string(::dds_DomainParticipantQos* qos) {
-	return dds_String::create([&]() { return ::dds_DomainParticipantQos_dump_as_string(qos); });
+	return dds_String::Create([&]() { return ::dds_DomainParticipantQos_dump_as_string(qos); });
 }
 
 inline dds_String dds_TopicQos_dump_as_string(::dds_TopicQos* qos) {
-	return dds_String::create([&]() { return ::dds_TopicQos_dump_as_string(qos); });
+	return dds_String::Create([&]() { return ::dds_TopicQos_dump_as_string(qos); });
 }
 
 inline dds_String dds_PublisherQos_dump_as_string(::dds_PublisherQos* qos) {
-	return dds_String::create([&]() { return ::dds_PublisherQos_dump_as_string(qos); });
+	return dds_String::Create([&]() { return ::dds_PublisherQos_dump_as_string(qos); });
 }
 
 inline dds_String dds_SubscriberQos_dump_as_string(::dds_SubscriberQos* qos) {
-	return dds_String::create([&]() { return ::dds_SubscriberQos_dump_as_string(qos); });
+	return dds_String::Create([&]() { return ::dds_SubscriberQos_dump_as_string(qos); });
 }
 
 inline dds_String dds_DataWriterQos_dump_as_string(::dds_DataWriterQos* qos) {
-	return dds_String::create([&]() { return ::dds_DataWriterQos_dump_as_string(qos); });
+	return dds_String::Create([&]() { return ::dds_DataWriterQos_dump_as_string(qos); });
 }
 
 inline dds_String dds_DataReaderQos_dump_as_string(::dds_DataReaderQos* qos) {
-	return dds_String::create([&]() { return ::dds_DataReaderQos_dump_as_string(qos); });
+	return dds_String::Create([&]() { return ::dds_DataReaderQos_dump_as_string(qos); });
 }
 
 struct dds_TypeSupportData_deleter {
@@ -2512,42 +2512,42 @@ using dds_TypeSupportData = Resource<void, dds_TypeSupportData_deleter>;
 inline dds_TypeSupportData dds_TypeSupport_create_data(const dds_TypeSupport& self) {
 	dds_TypeSupportData_deleter cleanup;
 	cleanup.support = self.get();
-	cleanup.support_owner = self.owner();
+	cleanup.support_owner = self.GetOwner();
 	cleanup.initialized = true;
-	return dds_TypeSupportData::create([&]() { return ::dds_TypeSupport_create_data(self); }, cleanup);
+	return dds_TypeSupportData::Create([&]() { return ::dds_TypeSupport_create_data(self); }, cleanup);
 }
 
 inline dds_TypeSupportData dds_TypeSupport_alloc(const dds_TypeSupport& self) {
 	dds_TypeSupportData_deleter cleanup;
 	cleanup.support = self.get();
-	cleanup.support_owner = self.owner();
+	cleanup.support_owner = self.GetOwner();
 	cleanup.initialized = false;
-	return dds_TypeSupportData::create([&]() { return ::dds_TypeSupport_alloc(self); }, cleanup);
+	return dds_TypeSupportData::Create([&]() { return ::dds_TypeSupport_alloc(self); }, cleanup);
 }
 
 inline dds_TypeSupportData dds_TypeSupport_clone_data(const dds_TypeSupport& self, void* data) {
 	dds_TypeSupportData_deleter cleanup;
 	cleanup.support = self.get();
-	cleanup.support_owner = self.owner();
+	cleanup.support_owner = self.GetOwner();
 	cleanup.initialized = true;
-	return dds_TypeSupportData::create([&]() { return ::dds_TypeSupport_clone_data(self, data); }, cleanup);
+	return dds_TypeSupportData::Create([&]() { return ::dds_TypeSupport_clone_data(self, data); }, cleanup);
 }
 
 inline dds_TypeSupportData dds_TypeSupport_deserialize(const dds_TypeSupport& self, void* input, size_t inputSize) {
 	dds_TypeSupportData_deleter cleanup;
 	cleanup.support = self.get();
-	cleanup.support_owner = self.owner();
+	cleanup.support_owner = self.GetOwner();
 	cleanup.initialized = true;
-	return dds_TypeSupportData::create(
+	return dds_TypeSupportData::Create(
 	    [&]() { return ::dds_TypeSupport_deserialize(self, input, inputSize); }, cleanup);
 }
 
 inline void dds_TypeSupport_delete_data(const dds_TypeSupport& self, dds_TypeSupportData& data) {
 	if(!data)
 		return;
-	if(data.deleter()->support != self.get())
+	if(data.GetDeleter()->support != self.get())
 		throw std::invalid_argument("TypeSupport does not own this sample");
-	if(data.owner().use_count() > 2)
+	if(data.GetOwner().use_count() > 2)
 		throw std::logic_error("DDS sample is still in use");
 	::dds_TypeSupport_delete_data(self, data.get());
 	(void)data.release();
@@ -2556,9 +2556,9 @@ inline void dds_TypeSupport_delete_data(const dds_TypeSupport& self, dds_TypeSup
 inline void dds_TypeSupport_free(const dds_TypeSupport& self, dds_TypeSupportData& data) {
 	if(!data)
 		return;
-	if(data.deleter()->support != self.get())
+	if(data.GetDeleter()->support != self.get())
 		throw std::invalid_argument("TypeSupport does not own this sample");
-	if(data.owner().use_count() > 2)
+	if(data.GetOwner().use_count() > 2)
 		throw std::logic_error("DDS sample is still in use");
 	::dds_TypeSupport_free(self, data.get());
 	(void)data.release();
@@ -2576,7 +2576,7 @@ struct SequenceLoan {
 	::dds_UnsignedLongSeq* sizes = nullptr;
 	bool active = false;
 
-	::dds_ReturnCode_t finish() noexcept {
+	::dds_ReturnCode_t Finish() noexcept {
 		if(!active)
 			return dds_RETCODE_OK;
 		::dds_ReturnCode_t ret;
@@ -2608,11 +2608,11 @@ inline ::dds_ReturnCode_t dds_DataReader_read(const dds_DataReader& self,
 	loan->reader = detail::SharedImpl(self);
 	loan->data = dataValues;
 	loan->infos = sampleInfos;
-	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->finish(); };
-	auto ret = dataValues.prepare_loan(cleanup, loan.get(), self.get());
+	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->Finish(); };
+	auto ret = dataValues.PrepareLoan(cleanup, loan.get(), self.get());
 	if(ret != dds_RETCODE_OK)
 		return ret;
-	ret = sampleInfos.prepare_loan(cleanup, loan.get(), self.get());
+	ret = sampleInfos.PrepareLoan(cleanup, loan.get(), self.get());
 	if(ret != dds_RETCODE_OK)
 		return ret;
 	ret = ::dds_DataReader_read(self, dataValues, sampleInfos, maxSamples, sampleStates, viewStates, instanceStates);
@@ -2635,11 +2635,11 @@ inline ::dds_ReturnCode_t dds_DataReader_take(const dds_DataReader& self,
 	loan->reader = detail::SharedImpl(self);
 	loan->data = dataValues;
 	loan->infos = sampleInfos;
-	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->finish(); };
-	auto ret = dataValues.prepare_loan(cleanup, loan.get(), self.get());
+	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->Finish(); };
+	auto ret = dataValues.PrepareLoan(cleanup, loan.get(), self.get());
 	if(ret != dds_RETCODE_OK)
 		return ret;
-	ret = sampleInfos.prepare_loan(cleanup, loan.get(), self.get());
+	ret = sampleInfos.PrepareLoan(cleanup, loan.get(), self.get());
 	if(ret != dds_RETCODE_OK)
 		return ret;
 	ret = ::dds_DataReader_take(self, dataValues, sampleInfos, maxSamples, sampleStates, viewStates, instanceStates);
@@ -2660,11 +2660,11 @@ inline ::dds_ReturnCode_t dds_DataReader_read_w_condition(const dds_DataReader& 
 	loan->reader = detail::SharedImpl(self);
 	loan->data = dataValues;
 	loan->infos = sampleInfos;
-	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->finish(); };
-	auto ret = dataValues.prepare_loan(cleanup, loan.get(), self.get());
+	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->Finish(); };
+	auto ret = dataValues.PrepareLoan(cleanup, loan.get(), self.get());
 	if(ret != dds_RETCODE_OK)
 		return ret;
-	ret = sampleInfos.prepare_loan(cleanup, loan.get(), self.get());
+	ret = sampleInfos.PrepareLoan(cleanup, loan.get(), self.get());
 	if(ret != dds_RETCODE_OK)
 		return ret;
 	ret = ::dds_DataReader_read_w_condition(self, dataValues, sampleInfos, maxSamples, aCondition);
@@ -2685,11 +2685,11 @@ inline ::dds_ReturnCode_t dds_DataReader_take_w_condition(const dds_DataReader& 
 	loan->reader = detail::SharedImpl(self);
 	loan->data = dataValues;
 	loan->infos = sampleInfos;
-	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->finish(); };
-	auto ret = dataValues.prepare_loan(cleanup, loan.get(), self.get());
+	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->Finish(); };
+	auto ret = dataValues.PrepareLoan(cleanup, loan.get(), self.get());
 	if(ret != dds_RETCODE_OK)
 		return ret;
-	ret = sampleInfos.prepare_loan(cleanup, loan.get(), self.get());
+	ret = sampleInfos.PrepareLoan(cleanup, loan.get(), self.get());
 	if(ret != dds_RETCODE_OK)
 		return ret;
 	ret = ::dds_DataReader_take_w_condition(self, dataValues, sampleInfos, maxSamples, aCondition);
@@ -2713,11 +2713,11 @@ inline ::dds_ReturnCode_t dds_DataReader_read_instance(const dds_DataReader& sel
 	loan->reader = detail::SharedImpl(self);
 	loan->data = dataValues;
 	loan->infos = sampleInfos;
-	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->finish(); };
-	auto ret = dataValues.prepare_loan(cleanup, loan.get(), self.get());
+	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->Finish(); };
+	auto ret = dataValues.PrepareLoan(cleanup, loan.get(), self.get());
 	if(ret != dds_RETCODE_OK)
 		return ret;
-	ret = sampleInfos.prepare_loan(cleanup, loan.get(), self.get());
+	ret = sampleInfos.PrepareLoan(cleanup, loan.get(), self.get());
 	if(ret != dds_RETCODE_OK)
 		return ret;
 	ret = ::dds_DataReader_read_instance(
@@ -2742,11 +2742,11 @@ inline ::dds_ReturnCode_t dds_DataReader_take_instance(const dds_DataReader& sel
 	loan->reader = detail::SharedImpl(self);
 	loan->data = dataValues;
 	loan->infos = sampleInfos;
-	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->finish(); };
-	auto ret = dataValues.prepare_loan(cleanup, loan.get(), self.get());
+	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->Finish(); };
+	auto ret = dataValues.PrepareLoan(cleanup, loan.get(), self.get());
 	if(ret != dds_RETCODE_OK)
 		return ret;
-	ret = sampleInfos.prepare_loan(cleanup, loan.get(), self.get());
+	ret = sampleInfos.PrepareLoan(cleanup, loan.get(), self.get());
 	if(ret != dds_RETCODE_OK)
 		return ret;
 	ret = ::dds_DataReader_take_instance(
@@ -2771,11 +2771,11 @@ inline ::dds_ReturnCode_t dds_DataReader_read_next_instance(const dds_DataReader
 	loan->reader = detail::SharedImpl(self);
 	loan->data = dataValues;
 	loan->infos = sampleInfos;
-	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->finish(); };
-	auto ret = dataValues.prepare_loan(cleanup, loan.get(), self.get());
+	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->Finish(); };
+	auto ret = dataValues.PrepareLoan(cleanup, loan.get(), self.get());
 	if(ret != dds_RETCODE_OK)
 		return ret;
-	ret = sampleInfos.prepare_loan(cleanup, loan.get(), self.get());
+	ret = sampleInfos.PrepareLoan(cleanup, loan.get(), self.get());
 	if(ret != dds_RETCODE_OK)
 		return ret;
 	ret = ::dds_DataReader_read_next_instance(
@@ -2800,11 +2800,11 @@ inline ::dds_ReturnCode_t dds_DataReader_take_next_instance(const dds_DataReader
 	loan->reader = detail::SharedImpl(self);
 	loan->data = dataValues;
 	loan->infos = sampleInfos;
-	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->finish(); };
-	auto ret = dataValues.prepare_loan(cleanup, loan.get(), self.get());
+	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->Finish(); };
+	auto ret = dataValues.PrepareLoan(cleanup, loan.get(), self.get());
 	if(ret != dds_RETCODE_OK)
 		return ret;
-	ret = sampleInfos.prepare_loan(cleanup, loan.get(), self.get());
+	ret = sampleInfos.PrepareLoan(cleanup, loan.get(), self.get());
 	if(ret != dds_RETCODE_OK)
 		return ret;
 	ret = ::dds_DataReader_take_next_instance(
@@ -2827,11 +2827,11 @@ inline ::dds_ReturnCode_t dds_DataReader_read_next_instance_w_condition(const dd
 	loan->reader = detail::SharedImpl(self);
 	loan->data = dataValues;
 	loan->infos = sampleInfos;
-	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->finish(); };
-	auto ret = dataValues.prepare_loan(cleanup, loan.get(), self.get());
+	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->Finish(); };
+	auto ret = dataValues.PrepareLoan(cleanup, loan.get(), self.get());
 	if(ret != dds_RETCODE_OK)
 		return ret;
-	ret = sampleInfos.prepare_loan(cleanup, loan.get(), self.get());
+	ret = sampleInfos.PrepareLoan(cleanup, loan.get(), self.get());
 	if(ret != dds_RETCODE_OK)
 		return ret;
 	ret = ::dds_DataReader_read_next_instance_w_condition(
@@ -2854,11 +2854,11 @@ inline ::dds_ReturnCode_t dds_DataReader_take_next_instance_w_condition(const dd
 	loan->reader = detail::SharedImpl(self);
 	loan->data = dataValues;
 	loan->infos = sampleInfos;
-	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->finish(); };
-	auto ret = dataValues.prepare_loan(cleanup, loan.get(), self.get());
+	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->Finish(); };
+	auto ret = dataValues.PrepareLoan(cleanup, loan.get(), self.get());
 	if(ret != dds_RETCODE_OK)
 		return ret;
-	ret = sampleInfos.prepare_loan(cleanup, loan.get(), self.get());
+	ret = sampleInfos.PrepareLoan(cleanup, loan.get(), self.get());
 	if(ret != dds_RETCODE_OK)
 		return ret;
 	ret = ::dds_DataReader_take_next_instance_w_condition(
@@ -2882,11 +2882,11 @@ inline ::dds_ReturnCode_t dds_DynamicDataReader_read(const dds_DataReader& self,
 	loan->reader = detail::SharedImpl(self);
 	loan->dynamic_data = dataValues;
 	loan->infos = sampleInfos;
-	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->finish(); };
-	auto ret = dataValues.prepare_loan(cleanup, loan.get(), self.get());
+	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->Finish(); };
+	auto ret = dataValues.PrepareLoan(cleanup, loan.get(), self.get());
 	if(ret != dds_RETCODE_OK)
 		return ret;
-	ret = sampleInfos.prepare_loan(cleanup, loan.get(), self.get());
+	ret = sampleInfos.PrepareLoan(cleanup, loan.get(), self.get());
 	if(ret != dds_RETCODE_OK)
 		return ret;
 	ret = ::dds_DynamicDataReader_read(
@@ -2910,11 +2910,11 @@ inline ::dds_ReturnCode_t dds_DynamicDataReader_take(const dds_DataReader& self,
 	loan->reader = detail::SharedImpl(self);
 	loan->dynamic_data = dataValues;
 	loan->infos = sampleInfos;
-	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->finish(); };
-	auto ret = dataValues.prepare_loan(cleanup, loan.get(), self.get());
+	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->Finish(); };
+	auto ret = dataValues.PrepareLoan(cleanup, loan.get(), self.get());
 	if(ret != dds_RETCODE_OK)
 		return ret;
-	ret = sampleInfos.prepare_loan(cleanup, loan.get(), self.get());
+	ret = sampleInfos.PrepareLoan(cleanup, loan.get(), self.get());
 	if(ret != dds_RETCODE_OK)
 		return ret;
 	ret = ::dds_DynamicDataReader_take(
@@ -2936,11 +2936,11 @@ inline ::dds_ReturnCode_t dds_DynamicDataReader_read_w_condition(const dds_DataR
 	loan->reader = detail::SharedImpl(self);
 	loan->dynamic_data = dataValues;
 	loan->infos = sampleInfos;
-	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->finish(); };
-	auto ret = dataValues.prepare_loan(cleanup, loan.get(), self.get());
+	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->Finish(); };
+	auto ret = dataValues.PrepareLoan(cleanup, loan.get(), self.get());
 	if(ret != dds_RETCODE_OK)
 		return ret;
-	ret = sampleInfos.prepare_loan(cleanup, loan.get(), self.get());
+	ret = sampleInfos.PrepareLoan(cleanup, loan.get(), self.get());
 	if(ret != dds_RETCODE_OK)
 		return ret;
 	ret = ::dds_DynamicDataReader_read_w_condition(self, dataValues, sampleInfos, maxSamples, aCondition);
@@ -2961,11 +2961,11 @@ inline ::dds_ReturnCode_t dds_DynamicDataReader_take_w_condition(const dds_DataR
 	loan->reader = detail::SharedImpl(self);
 	loan->dynamic_data = dataValues;
 	loan->infos = sampleInfos;
-	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->finish(); };
-	auto ret = dataValues.prepare_loan(cleanup, loan.get(), self.get());
+	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->Finish(); };
+	auto ret = dataValues.PrepareLoan(cleanup, loan.get(), self.get());
 	if(ret != dds_RETCODE_OK)
 		return ret;
-	ret = sampleInfos.prepare_loan(cleanup, loan.get(), self.get());
+	ret = sampleInfos.PrepareLoan(cleanup, loan.get(), self.get());
 	if(ret != dds_RETCODE_OK)
 		return ret;
 	ret = ::dds_DynamicDataReader_take_w_condition(self, dataValues, sampleInfos, maxSamples, aCondition);
@@ -2989,11 +2989,11 @@ inline ::dds_ReturnCode_t dds_DynamicDataReader_read_instance(const dds_DataRead
 	loan->reader = detail::SharedImpl(self);
 	loan->dynamic_data = dataValues;
 	loan->infos = sampleInfos;
-	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->finish(); };
-	auto ret = dataValues.prepare_loan(cleanup, loan.get(), self.get());
+	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->Finish(); };
+	auto ret = dataValues.PrepareLoan(cleanup, loan.get(), self.get());
 	if(ret != dds_RETCODE_OK)
 		return ret;
-	ret = sampleInfos.prepare_loan(cleanup, loan.get(), self.get());
+	ret = sampleInfos.PrepareLoan(cleanup, loan.get(), self.get());
 	if(ret != dds_RETCODE_OK)
 		return ret;
 	ret = ::dds_DynamicDataReader_read_instance(
@@ -3018,11 +3018,11 @@ inline ::dds_ReturnCode_t dds_DynamicDataReader_take_instance(const dds_DataRead
 	loan->reader = detail::SharedImpl(self);
 	loan->dynamic_data = dataValues;
 	loan->infos = sampleInfos;
-	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->finish(); };
-	auto ret = dataValues.prepare_loan(cleanup, loan.get(), self.get());
+	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->Finish(); };
+	auto ret = dataValues.PrepareLoan(cleanup, loan.get(), self.get());
 	if(ret != dds_RETCODE_OK)
 		return ret;
-	ret = sampleInfos.prepare_loan(cleanup, loan.get(), self.get());
+	ret = sampleInfos.PrepareLoan(cleanup, loan.get(), self.get());
 	if(ret != dds_RETCODE_OK)
 		return ret;
 	ret = ::dds_DynamicDataReader_take_instance(
@@ -3047,11 +3047,11 @@ inline ::dds_ReturnCode_t dds_DynamicDataReader_read_next_instance(const dds_Dat
 	loan->reader = detail::SharedImpl(self);
 	loan->dynamic_data = dataValues;
 	loan->infos = sampleInfos;
-	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->finish(); };
-	auto ret = dataValues.prepare_loan(cleanup, loan.get(), self.get());
+	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->Finish(); };
+	auto ret = dataValues.PrepareLoan(cleanup, loan.get(), self.get());
 	if(ret != dds_RETCODE_OK)
 		return ret;
-	ret = sampleInfos.prepare_loan(cleanup, loan.get(), self.get());
+	ret = sampleInfos.PrepareLoan(cleanup, loan.get(), self.get());
 	if(ret != dds_RETCODE_OK)
 		return ret;
 	ret = ::dds_DynamicDataReader_read_next_instance(
@@ -3076,11 +3076,11 @@ inline ::dds_ReturnCode_t dds_DynamicDataReader_take_next_instance(const dds_Dat
 	loan->reader = detail::SharedImpl(self);
 	loan->dynamic_data = dataValues;
 	loan->infos = sampleInfos;
-	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->finish(); };
-	auto ret = dataValues.prepare_loan(cleanup, loan.get(), self.get());
+	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->Finish(); };
+	auto ret = dataValues.PrepareLoan(cleanup, loan.get(), self.get());
 	if(ret != dds_RETCODE_OK)
 		return ret;
-	ret = sampleInfos.prepare_loan(cleanup, loan.get(), self.get());
+	ret = sampleInfos.PrepareLoan(cleanup, loan.get(), self.get());
 	if(ret != dds_RETCODE_OK)
 		return ret;
 	ret = ::dds_DynamicDataReader_take_next_instance(
@@ -3103,11 +3103,11 @@ inline ::dds_ReturnCode_t dds_DynamicDataReader_read_next_instance_w_condition(c
 	loan->reader = detail::SharedImpl(self);
 	loan->dynamic_data = dataValues;
 	loan->infos = sampleInfos;
-	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->finish(); };
-	auto ret = dataValues.prepare_loan(cleanup, loan.get(), self.get());
+	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->Finish(); };
+	auto ret = dataValues.PrepareLoan(cleanup, loan.get(), self.get());
 	if(ret != dds_RETCODE_OK)
 		return ret;
-	ret = sampleInfos.prepare_loan(cleanup, loan.get(), self.get());
+	ret = sampleInfos.PrepareLoan(cleanup, loan.get(), self.get());
 	if(ret != dds_RETCODE_OK)
 		return ret;
 	ret = ::dds_DynamicDataReader_read_next_instance_w_condition(
@@ -3130,11 +3130,11 @@ inline ::dds_ReturnCode_t dds_DynamicDataReader_take_next_instance_w_condition(c
 	loan->reader = detail::SharedImpl(self);
 	loan->dynamic_data = dataValues;
 	loan->infos = sampleInfos;
-	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->finish(); };
-	auto ret = dataValues.prepare_loan(cleanup, loan.get(), self.get());
+	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->Finish(); };
+	auto ret = dataValues.PrepareLoan(cleanup, loan.get(), self.get());
 	if(ret != dds_RETCODE_OK)
 		return ret;
-	ret = sampleInfos.prepare_loan(cleanup, loan.get(), self.get());
+	ret = sampleInfos.PrepareLoan(cleanup, loan.get(), self.get());
 	if(ret != dds_RETCODE_OK)
 		return ret;
 	ret = ::dds_DynamicDataReader_take_next_instance_w_condition(
@@ -3158,11 +3158,11 @@ inline ::dds_ReturnCode_t dds_DataReader_read_w_sampleinfoex(const dds_DataReade
 	loan->reader = detail::SharedImpl(self);
 	loan->data = dataValues;
 	loan->infos = sampleInfos;
-	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->finish(); };
-	auto ret = dataValues.prepare_loan(cleanup, loan.get(), self.get());
+	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->Finish(); };
+	auto ret = dataValues.PrepareLoan(cleanup, loan.get(), self.get());
 	if(ret != dds_RETCODE_OK)
 		return ret;
-	ret = sampleInfos.prepare_loan(cleanup, loan.get(), self.get());
+	ret = sampleInfos.PrepareLoan(cleanup, loan.get(), self.get());
 	if(ret != dds_RETCODE_OK)
 		return ret;
 	ret = ::dds_DataReader_read_w_sampleinfoex(
@@ -3186,11 +3186,11 @@ inline ::dds_ReturnCode_t dds_DataReader_take_w_sampleinfoex(const dds_DataReade
 	loan->reader = detail::SharedImpl(self);
 	loan->data = dataValues;
 	loan->infos = sampleInfos;
-	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->finish(); };
-	auto ret = dataValues.prepare_loan(cleanup, loan.get(), self.get());
+	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->Finish(); };
+	auto ret = dataValues.PrepareLoan(cleanup, loan.get(), self.get());
 	if(ret != dds_RETCODE_OK)
 		return ret;
-	ret = sampleInfos.prepare_loan(cleanup, loan.get(), self.get());
+	ret = sampleInfos.PrepareLoan(cleanup, loan.get(), self.get());
 	if(ret != dds_RETCODE_OK)
 		return ret;
 	ret = ::dds_DataReader_take_w_sampleinfoex(
@@ -3217,14 +3217,14 @@ inline ::dds_ReturnCode_t dds_DataReader_raw_read(const dds_DataReader& self,
 	loan->data = rawDataValues;
 	loan->infos = sampleInfos;
 	loan->sizes = rawDataSizes;
-	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->finish(); };
-	auto ret = rawDataValues.prepare_loan(cleanup, loan.get(), self.get());
+	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->Finish(); };
+	auto ret = rawDataValues.PrepareLoan(cleanup, loan.get(), self.get());
 	if(ret != dds_RETCODE_OK)
 		return ret;
-	ret = sampleInfos.prepare_loan(cleanup, loan.get(), self.get());
+	ret = sampleInfos.PrepareLoan(cleanup, loan.get(), self.get());
 	if(ret != dds_RETCODE_OK)
 		return ret;
-	ret = rawDataSizes.prepare_loan(cleanup, loan.get(), self.get());
+	ret = rawDataSizes.PrepareLoan(cleanup, loan.get(), self.get());
 	if(ret != dds_RETCODE_OK)
 		return ret;
 	ret = ::dds_DataReader_raw_read(
@@ -3251,14 +3251,14 @@ inline ::dds_ReturnCode_t dds_DataReader_raw_read_w_sampleinfoex(const dds_DataR
 	loan->data = rawDataValues;
 	loan->infos = sampleInfoexs;
 	loan->sizes = rawDataSizes;
-	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->finish(); };
-	auto ret = rawDataValues.prepare_loan(cleanup, loan.get(), self.get());
+	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->Finish(); };
+	auto ret = rawDataValues.PrepareLoan(cleanup, loan.get(), self.get());
 	if(ret != dds_RETCODE_OK)
 		return ret;
-	ret = sampleInfoexs.prepare_loan(cleanup, loan.get(), self.get());
+	ret = sampleInfoexs.PrepareLoan(cleanup, loan.get(), self.get());
 	if(ret != dds_RETCODE_OK)
 		return ret;
-	ret = rawDataSizes.prepare_loan(cleanup, loan.get(), self.get());
+	ret = rawDataSizes.PrepareLoan(cleanup, loan.get(), self.get());
 	if(ret != dds_RETCODE_OK)
 		return ret;
 	ret = ::dds_DataReader_raw_read_w_sampleinfoex(
@@ -3285,14 +3285,14 @@ inline ::dds_ReturnCode_t dds_DataReader_raw_take(const dds_DataReader& self,
 	loan->data = rawDataValues;
 	loan->infos = sampleInfos;
 	loan->sizes = rawDataSizes;
-	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->finish(); };
-	auto ret = rawDataValues.prepare_loan(cleanup, loan.get(), self.get());
+	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->Finish(); };
+	auto ret = rawDataValues.PrepareLoan(cleanup, loan.get(), self.get());
 	if(ret != dds_RETCODE_OK)
 		return ret;
-	ret = sampleInfos.prepare_loan(cleanup, loan.get(), self.get());
+	ret = sampleInfos.PrepareLoan(cleanup, loan.get(), self.get());
 	if(ret != dds_RETCODE_OK)
 		return ret;
-	ret = rawDataSizes.prepare_loan(cleanup, loan.get(), self.get());
+	ret = rawDataSizes.PrepareLoan(cleanup, loan.get(), self.get());
 	if(ret != dds_RETCODE_OK)
 		return ret;
 	ret = ::dds_DataReader_raw_take(
@@ -3319,14 +3319,14 @@ inline ::dds_ReturnCode_t dds_DataReader_raw_take_w_sampleinfoex(const dds_DataR
 	loan->data = rawDataValues;
 	loan->infos = sampleInfoexs;
 	loan->sizes = rawDataSizes;
-	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->finish(); };
-	auto ret = rawDataValues.prepare_loan(cleanup, loan.get(), self.get());
+	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->Finish(); };
+	auto ret = rawDataValues.PrepareLoan(cleanup, loan.get(), self.get());
 	if(ret != dds_RETCODE_OK)
 		return ret;
-	ret = sampleInfoexs.prepare_loan(cleanup, loan.get(), self.get());
+	ret = sampleInfoexs.PrepareLoan(cleanup, loan.get(), self.get());
 	if(ret != dds_RETCODE_OK)
 		return ret;
-	ret = rawDataSizes.prepare_loan(cleanup, loan.get(), self.get());
+	ret = rawDataSizes.PrepareLoan(cleanup, loan.get(), self.get());
 	if(ret != dds_RETCODE_OK)
 		return ret;
 	ret = ::dds_DataReader_raw_take_w_sampleinfoex(
@@ -3341,17 +3341,17 @@ inline ::dds_ReturnCode_t dds_DataReader_return_loan(
     const dds_DataReader& self, dds_DataSeq& data, dds_SampleInfoSeq& infos) noexcept {
 	if(!self || !data || !infos)
 		return dds_RETCODE_BAD_PARAMETER;
-	if(data.loan_identity()) {
-		if(data.loan_identity() != infos.loan_identity() || data.loan_reader() != self.get())
+	if(data.GetLoanIdentity()) {
+		if(data.GetLoanIdentity() != infos.GetLoanIdentity() || data.GetLoanReader() != self.get())
 			return dds_RETCODE_PRECONDITION_NOT_MET;
-		auto ret = data.finish_loan();
+		auto ret = data.FinishLoan();
 		if(ret != dds_RETCODE_OK)
 			return ret;
-		(void)infos.finish_loan();
+		(void)infos.FinishLoan();
 
 		return ret;
 	}
-	if(infos.loan_identity())
+	if(infos.GetLoanIdentity())
 		return dds_RETCODE_PRECONDITION_NOT_MET;
 	return ::dds_DataReader_return_loan(self, data, infos);
 }
@@ -3360,18 +3360,18 @@ inline ::dds_ReturnCode_t dds_DataReader_raw_return_loan(
     const dds_DataReader& self, dds_DataSeq& data, dds_SampleInfoSeq& infos, dds_UnsignedLongSeq& sizes) noexcept {
 	if(!self || !data || !infos || !sizes)
 		return dds_RETCODE_BAD_PARAMETER;
-	if(data.loan_identity()) {
-		if(data.loan_identity() != infos.loan_identity() || data.loan_reader() != self.get() ||
-		    data.loan_identity() != sizes.loan_identity())
+	if(data.GetLoanIdentity()) {
+		if(data.GetLoanIdentity() != infos.GetLoanIdentity() || data.GetLoanReader() != self.get() ||
+		    data.GetLoanIdentity() != sizes.GetLoanIdentity())
 			return dds_RETCODE_PRECONDITION_NOT_MET;
-		auto ret = data.finish_loan();
+		auto ret = data.FinishLoan();
 		if(ret != dds_RETCODE_OK)
 			return ret;
-		(void)infos.finish_loan();
-		(void)sizes.finish_loan();
+		(void)infos.FinishLoan();
+		(void)sizes.FinishLoan();
 		return ret;
 	}
-	if(infos.loan_identity() || sizes.loan_identity())
+	if(infos.GetLoanIdentity() || sizes.GetLoanIdentity())
 		return dds_RETCODE_PRECONDITION_NOT_MET;
 	return ::dds_DataReader_raw_return_loan(self, data, infos, sizes);
 }
@@ -3380,17 +3380,17 @@ inline ::dds_ReturnCode_t dds_DynamicDataReader_return_loan(
     const dds_DataReader& self, dds_DynamicDataSeq& data, dds_SampleInfoSeq& infos) noexcept {
 	if(!self || !data || !infos)
 		return dds_RETCODE_BAD_PARAMETER;
-	if(data.loan_identity()) {
-		if(data.loan_identity() != infos.loan_identity() || data.loan_reader() != self.get())
+	if(data.GetLoanIdentity()) {
+		if(data.GetLoanIdentity() != infos.GetLoanIdentity() || data.GetLoanReader() != self.get())
 			return dds_RETCODE_PRECONDITION_NOT_MET;
-		auto ret = data.finish_loan();
+		auto ret = data.FinishLoan();
 		if(ret != dds_RETCODE_OK)
 			return ret;
-		(void)infos.finish_loan();
+		(void)infos.FinishLoan();
 
 		return ret;
 	}
-	if(infos.loan_identity())
+	if(infos.GetLoanIdentity())
 		return dds_RETCODE_PRECONDITION_NOT_MET;
 	return ::dds_DynamicDataReader_return_loan(self, data, infos);
 }
@@ -3409,7 +3409,7 @@ inline ::dds_ReturnCode_t dds_DataReader_return_loaned_sample(
     const dds_DataReader& self, dds_ReaderLoan& sample) noexcept {
 	if(!self || !sample)
 		return dds_RETCODE_BAD_PARAMETER;
-	if(sample.deleter()->reader != detail::SharedImpl(self))
+	if(sample.GetDeleter()->reader != detail::SharedImpl(self))
 		return dds_RETCODE_PRECONDITION_NOT_MET;
 	return sample.close();
 }
@@ -3426,7 +3426,7 @@ struct dds_WriterLoan_deleter {
 using dds_WriterLoan = Resource<void, dds_WriterLoan_deleter>;
 
 inline void dds_DataWriter_return_loaned_sample(const dds_DataWriter& self, dds_WriterLoan& sample) {
-	if(sample && sample.deleter()->writer != detail::SharedImpl(self))
+	if(sample && sample.GetDeleter()->writer != detail::SharedImpl(self))
 		throw std::invalid_argument("DataWriter does not own this loan");
 	sample.reset();
 }
@@ -3439,7 +3439,7 @@ inline ::dds_ReturnCode_t dds_DataWriter_get_loan(const dds_DataWriter& self, dd
 		return ret;
 	dds_WriterLoan_deleter cleanup;
 	cleanup.writer = detail::SharedImpl(self);
-	sample = dds_WriterLoan::create(
+	sample = dds_WriterLoan::Create(
 	    [&]() {
 		    void* raw = nullptr;
 		    ret = ::dds_DataWriter_get_loan(self, &raw, size);
@@ -3458,7 +3458,7 @@ inline ::dds_ReturnCode_t dds_DataReader_read_next_loaned_sample(
 		return ret;
 	dds_ReaderLoan_deleter cleanup;
 	cleanup.reader = detail::SharedImpl(self);
-	sample = dds_ReaderLoan::create(
+	sample = dds_ReaderLoan::Create(
 	    [&]() {
 		    void* raw = nullptr;
 		    ret = ::dds_DataReader_read_next_loaned_sample(self, &raw, info);
@@ -3477,7 +3477,7 @@ inline ::dds_ReturnCode_t dds_DataReader_take_next_loaned_sample(
 		return ret;
 	dds_ReaderLoan_deleter cleanup;
 	cleanup.reader = detail::SharedImpl(self);
-	sample = dds_ReaderLoan::create(
+	sample = dds_ReaderLoan::Create(
 	    [&]() {
 		    void* raw = nullptr;
 		    ret = ::dds_DataReader_take_next_loaned_sample(self, &raw, info);
@@ -3576,13 +3576,13 @@ inline dds_StatusCondition dds_DataReader_get_statuscondition(const dds_DataRead
 inline ::dds_ReturnCode_t dds_WaitSet_attach_condition(const dds_WaitSet& self, const dds_StatusCondition& condition) {
 	if(!self || !condition)
 		return dds_RETCODE_BAD_PARAMETER;
-	return detail::SharedImpl(self)->attach(condition);
+	return detail::SharedImpl(self)->Attach(condition);
 }
 
 inline ::dds_ReturnCode_t dds_WaitSet_detach_condition(const dds_WaitSet& self, const dds_StatusCondition& condition) {
 	if(!self || !condition)
 		return dds_RETCODE_BAD_PARAMETER;
-	return detail::SharedImpl(self)->detach(condition);
+	return detail::SharedImpl(self)->Detach(condition);
 }
 
 // DynamicTypeBuilder objects and singleton factories are factory-owned in this
@@ -3601,19 +3601,19 @@ inline void dds_free(dds_WideString& value) noexcept {
 }
 
 inline dds_Wstring dds_wcsdup(const uint16_t* value) {
-	return dds_Wstring::create([=]() { return ::dds_wcsdup(value); });
+	return dds_Wstring::Create([=]() { return ::dds_wcsdup(value); });
 }
 
 inline dds_Wstring dds_wide_to_utf16(const wchar_t* value) {
-	return dds_Wstring::create([=]() { return ::dds_wide_to_utf16(value); });
+	return dds_Wstring::Create([=]() { return ::dds_wide_to_utf16(value); });
 }
 
 inline dds_WideString dds_utf16_to_wide(const ::dds_Wchar* value) {
-	return dds_WideString::create([=]() { return ::dds_utf16_to_wide(value); });
+	return dds_WideString::Create([=]() { return ::dds_utf16_to_wide(value); });
 }
 
 inline dds_String dds_StringTypeSupport_deserialize(void* input, size_t inputSize) {
-	return dds_String::create([=]() { return ::dds_StringTypeSupport_deserialize(input, inputSize); });
+	return dds_String::Create([=]() { return ::dds_StringTypeSupport_deserialize(input, inputSize); });
 }
 
 struct dds_md5_ctx_deleter {
@@ -3626,7 +3626,7 @@ struct dds_md5_ctx_deleter {
 using dds_md5_ctx = Resource<::dds_md5_ctx, dds_md5_ctx_deleter>;
 
 inline dds_md5_ctx dds_md5_ctx_alloc() {
-	return dds_md5_ctx::create([]() { return static_cast<::dds_md5_ctx*>(::dds_md5_ctx_alloc()); });
+	return dds_md5_ctx::Create([]() { return static_cast<::dds_md5_ctx*>(::dds_md5_ctx_alloc()); });
 }
 
 inline void dds_md5_ctx_free(dds_md5_ctx& context) noexcept {
@@ -3699,7 +3699,7 @@ inline std::vector<dds_DynamicTypeSupport> dds_DomainParticipant_lookup_delivere
 		return result;
 	result.reserve(::dds_DataSeq_length(sequence.get()));
 	while(::dds_DataSeq_length(sequence.get()) != 0) {
-		result.push_back(dds_DynamicTypeSupport::create(
+		result.push_back(dds_DynamicTypeSupport::Create(
 		    [&]() { return static_cast<::dds_DynamicTypeSupport*>(::dds_DataSeq_remove(sequence.get(), 0)); }));
 	}
 	return result;
