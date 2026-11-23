@@ -2249,6 +2249,17 @@ struct DynamicDataAccess {
 		return data;
 	}
 
+	static dds_DynamicData Loan(::dds_DynamicData* parent, ::dds_MemberId_t id, std::shared_ptr<void> parentOwner) {
+		if(!parent)
+			return {};
+
+		dds_DynamicData_deleter cleanup;
+		cleanup.parent = parent;
+		cleanup.parent_owner = std::move(parentOwner);
+		return dds_DynamicData::create(
+		    [&]() { return ::dds_DynamicData_loan_value(parent, id); }, std::move(cleanup));
+	}
+
 	static ::dds_ReturnCode_t Delete(::dds_DynamicDataFactory* factory, dds_DynamicData& data) noexcept {
 		return data.CloseWith(
 		    [factory](::dds_DynamicData* raw) { return ::dds_DynamicDataFactory_delete_data(factory, raw); });
@@ -2271,10 +2282,13 @@ inline ::dds_ReturnCode_t dds_DynamicDataFactory_delete_data(
 }
 
 inline dds_DynamicData dds_DynamicData_loan_value(const dds_DynamicData& self, ::dds_MemberId_t id) {
-	dds_DynamicData_deleter cleanup;
-	cleanup.parent = self.get();
-	cleanup.parent_owner = self.owner();
-	return dds_DynamicData::create([&]() { return ::dds_DynamicData_loan_value(self, id); }, cleanup);
+	return detail::DynamicDataAccess::Loan(self.get(), id, self.owner());
+}
+
+// Pass a live parent. If it has no registered owner, keep it alive until the loan is returned.
+inline dds_DynamicData dds_DynamicData_loan_value(::dds_DynamicData* self, ::dds_MemberId_t id) {
+	auto parent{dds_DynamicData_lookup(self)};
+	return detail::DynamicDataAccess::Loan(self, id, parent.owner());
 }
 
 inline ::dds_ReturnCode_t dds_DynamicData_return_loaned_value(
