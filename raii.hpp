@@ -23,12 +23,12 @@
 #include <condition_variable>
 #include <cstring>
 #include <exception>
-#include <functional>
 #include <iostream>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
 #include <stdexcept>
+#include <string>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -70,6 +70,7 @@ struct LifecycleState {
 	std::recursive_mutex m_mutex;
 	// Allocate only when find first waits, preserving participant construction.
 	std::unique_ptr<std::condition_variable_any> m_changed;
+	std::unordered_multimap<std::string, std::weak_ptr<Topic>> m_topics;
 };
 
 struct LifecycleLock;
@@ -79,10 +80,10 @@ inline std::shared_ptr<DomainParticipant> GetParticipant(
 
 template <typename TImpl>
 std::shared_ptr<DomainParticipant> GetParticipant(const std::shared_ptr<TImpl>& impl) noexcept {
-	return impl ? GetParticipant(impl->m_parent) : std::shared_ptr<DomainParticipant>{};
+	if(!impl)
+		return {};
+	return GetParticipant(impl->m_parent);
 }
-
-inline void NotifyLifecycle(const std::shared_ptr<DomainParticipant>& participant);
 
 inline void TerminateOnError(::dds_ReturnCode_t ret, const char* func) noexcept {
 	if(ret != dds_RETCODE_OK) {
@@ -206,7 +207,9 @@ public:
 	}
 
 	DDSType* get() const noexcept {
-		return m_sharedptr ? **m_sharedptr : nullptr;
+		if(!m_sharedptr)
+			return nullptr;
+		return **m_sharedptr;
 	}
 
 	bool operator==(const DDSEntity& other) const noexcept {
@@ -325,7 +328,6 @@ template <typename TImpl, typename TRaw, typename... TArgs>
 std::shared_ptr<TImpl> MakeRegisteredOwned(TRaw* raw, const TArgs&... args) {
 	auto owner = MakeOwned<TImpl>(raw, args...);
 	RegisterOwner(raw, owner);
-	NotifyLifecycle(GetParticipant(owner));
 	return owner;
 }
 
@@ -390,7 +392,6 @@ public:
 private:
 	detail::LifecycleState m_lifecycle;
 	friend struct detail::LifecycleLock;
-	friend void detail::NotifyLifecycle(const std::shared_ptr<DomainParticipant>&);
 	::dds_DomainParticipant* m_entity{nullptr};
 };
 
@@ -407,9 +408,31 @@ struct LifecycleLock {
 	std::unique_lock<std::recursive_mutex> m_lock;
 
 	explicit LifecycleLock(std::shared_ptr<DomainParticipant> participant)
-	    : m_participant(std::move(participant))
-	    , m_lock(m_participant ? std::unique_lock<std::recursive_mutex>(m_participant->m_lifecycle.m_mutex)
-	                           : std::unique_lock<std::recursive_mutex>{}) {
+	    : m_participant(std::move(participant)) {
+		if(m_participant)
+			m_lock = std::unique_lock<std::recursive_mutex>(m_participant->m_lifecycle.m_mutex);
+	}
+
+	void RegisterTopic(const char* name, const std::shared_ptr<Topic>& topic) {
+		auto& lifecycle = m_participant->m_lifecycle;
+		for(auto it = lifecycle.m_topics.begin(); it != lifecycle.m_topics.end();) {
+			if(it->second.expired())
+				it = lifecycle.m_topics.erase(it);
+			else
+				++it;
+		}
+		lifecycle.m_topics.emplace(name, topic);
+		if(lifecycle.m_changed)
+			lifecycle.m_changed->notify_all();
+	}
+
+	std::shared_ptr<Topic> FindTopic(const std::string& name) const {
+		const auto candidates{m_participant->m_lifecycle.m_topics.equal_range(name)};
+		for(auto it = candidates.first; it != candidates.second; ++it) {
+			if(auto topic = it->second.lock())
+				return topic;
+		}
+		return {};
 	}
 
 	void Wait() {
@@ -434,10 +457,6 @@ LifecycleLock LockLifecycle(const std::shared_ptr<TImpl>& impl) {
 	return LifecycleLock(GetParticipant(impl));
 }
 
-inline void NotifyLifecycle(const std::shared_ptr<DomainParticipant>& participant) {
-	if(participant && participant->m_lifecycle.m_changed)
-		participant->m_lifecycle.m_changed->notify_all();
-}
 } // namespace detail
 
 class Topic {
@@ -600,17 +619,21 @@ public:
 	}
 
 	dds_Topic as_topic() const noexcept {
-		return m_kind == Kind::Topic ? dds_Topic(std::static_pointer_cast<Topic>(m_owner)) : dds_Topic{};
+		if(m_kind != Kind::Topic)
+			return {};
+		return dds_Topic(std::static_pointer_cast<Topic>(m_owner));
 	}
 
 	dds_ContentFilteredTopic as_contentfilteredtopic() const noexcept {
-		return m_kind == Kind::Filtered
-		           ? dds_ContentFilteredTopic(std::static_pointer_cast<ContentFilteredTopic>(m_owner))
-		           : dds_ContentFilteredTopic{};
+		if(m_kind != Kind::Filtered)
+			return {};
+		return dds_ContentFilteredTopic(std::static_pointer_cast<ContentFilteredTopic>(m_owner));
 	}
 
 	dds_MultiTopic as_multitopic() const noexcept {
-		return m_kind == Kind::Multi ? dds_MultiTopic(std::static_pointer_cast<MultiTopic>(m_owner)) : dds_MultiTopic{};
+		if(m_kind != Kind::Multi)
+			return {};
+		return dds_MultiTopic(std::static_pointer_cast<MultiTopic>(m_owner));
 	}
 
 	const std::shared_ptr<void>& GetOwner() const noexcept {
@@ -630,12 +653,12 @@ private:
 };
 
 namespace detail {
-inline dds_TopicDescription RegisteredDescription(::dds_TopicDescription* raw) {
-	if(auto owner = RegisteredOwner<Topic>(reinterpret_cast<::dds_Topic*>(raw)))
+inline dds_TopicDescription RegisteredDescription(const ::dds_TopicDescription* raw) {
+	if(auto owner = RegisteredOwner<Topic>(reinterpret_cast<const ::dds_Topic*>(raw)))
 		return dds_TopicDescription(dds_Topic(owner));
-	if(auto owner = RegisteredOwner<ContentFilteredTopic>(reinterpret_cast<::dds_ContentFilteredTopic*>(raw)))
+	if(auto owner = RegisteredOwner<ContentFilteredTopic>(reinterpret_cast<const ::dds_ContentFilteredTopic*>(raw)))
 		return dds_TopicDescription(dds_ContentFilteredTopic(owner));
-	if(auto owner = RegisteredOwner<MultiTopic>(reinterpret_cast<::dds_MultiTopic*>(raw)))
+	if(auto owner = RegisteredOwner<MultiTopic>(reinterpret_cast<const ::dds_MultiTopic*>(raw)))
 		return dds_TopicDescription(dds_MultiTopic(owner));
 	return {};
 }
@@ -934,7 +957,6 @@ inline ::dds_ReturnCode_t dds_DomainParticipantFactory_delete_participant(
 	if(!aParticipant) {
 		return detail::BadParameter();
 	}
-	detail::ClearListener(static_cast<::dds_DomainParticipant*>(aParticipant));
 	::dds_ReturnCode_t ret = ::dds_DomainParticipantFactory_delete_participant(self, aParticipant);
 	if(ret == dds_RETCODE_OK) {
 		*detail::SharedImpl(aParticipant) = nullptr;
@@ -1013,7 +1035,6 @@ inline ::dds_ReturnCode_t dds_DomainParticipant_delete_publisher(
 	}
 	if(detail::SharedImpl(publisher).use_count() > 1)
 		return dds_RETCODE_PRECONDITION_NOT_MET;
-	detail::ClearListener(static_cast<::dds_Publisher*>(publisher));
 	::dds_ReturnCode_t ret =
 	    ::dds_DomainParticipant_delete_publisher(static_cast<::dds_DomainParticipant*>(self), publisher);
 	if(ret == dds_RETCODE_OK) {
@@ -1044,7 +1065,6 @@ inline ::dds_ReturnCode_t dds_DomainParticipant_delete_subscriber(
 	}
 	if(detail::SharedImpl(subscriber).use_count() > 1)
 		return dds_RETCODE_PRECONDITION_NOT_MET;
-	detail::ClearListener(static_cast<::dds_Subscriber*>(subscriber));
 	::dds_ReturnCode_t ret =
 	    ::dds_DomainParticipant_delete_subscriber(static_cast<::dds_DomainParticipant*>(self), subscriber);
 	if(ret == dds_RETCODE_OK) {
@@ -1066,7 +1086,9 @@ inline dds_Topic dds_DomainParticipant_create_topic(const dds_DomainParticipant&
 	if(raw == nullptr) {
 		return {};
 	}
-	return dds_Topic(detail::MakeRegisteredOwned<Topic>(raw, detail::SharedImpl(self)));
+	auto owner{detail::MakeRegisteredOwned<Topic>(raw, detail::SharedImpl(self))};
+	lifecycleLock.RegisterTopic(topicName, owner);
+	return dds_Topic(std::move(owner));
 }
 
 inline ::dds_ReturnCode_t dds_DomainParticipant_delete_topic(const dds_DomainParticipant& self, dds_Topic& topic) {
@@ -1076,7 +1098,6 @@ inline ::dds_ReturnCode_t dds_DomainParticipant_delete_topic(const dds_DomainPar
 	}
 	if(detail::SharedImpl(topic).use_count() > 1)
 		return dds_RETCODE_PRECONDITION_NOT_MET;
-	detail::ClearListener(static_cast<::dds_Topic*>(topic));
 	::dds_ReturnCode_t ret = ::dds_DomainParticipant_delete_topic(static_cast<::dds_DomainParticipant*>(self), topic);
 	if(ret == dds_RETCODE_OK) {
 		*detail::SharedImpl(topic) = nullptr;
@@ -1174,9 +1195,9 @@ inline dds_Topic dds_DomainParticipant_find_topic(
 	const bool infinite = timeout->sec == dds_DURATION_INFINITE_SEC && timeout->nanosec == dds_DURATION_INFINITE_NSEC;
 	const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout->sec) +
 	                      std::chrono::nanoseconds(timeout->nanosec);
+	const std::string name{topicName};
 	for(;;) {
-		auto raw = ::dds_DomainParticipant_lookup_topicdescription(self, topicName);
-		auto owner = detail::RegisteredOwner<Topic>(reinterpret_cast<::dds_Topic*>(raw));
+		auto owner{lifecycleLock.FindTopic(name)};
 		if(owner)
 			return dds_Topic(std::move(owner));
 		if(infinite) {
@@ -1285,21 +1306,20 @@ inline dds_DataWriter dds_Publisher_create_datawriter_w_profile(const dds_Publis
 	    detail::MakeRegisteredOwned<DataWriter>(raw, detail::SharedImpl(self), detail::SharedImpl(aTopic)));
 }
 
-// Raw topic pointers are borrowed. The caller must keep the topic alive until
-// the endpoint is deleted; only its publisher/subscriber is retained.
+// 등록된 토픽은 엔드포인트가 유지합니다. 외부 토픽의 수명은 호출자가 관리합니다.
 inline dds_DataWriter dds_Publisher_create_datawriter(const dds_Publisher& self,
     const ::dds_Topic* aTopic,
     const ::dds_DataWriterQos* qos,
     const ::dds_DataWriterListener* aListener,
     ::dds_StatusMask mask) {
 	auto lifecycleLock = detail::LockLifecycle(detail::SharedImpl(self));
+	auto topicOwner{detail::RegisteredOwner<Topic>(aTopic)};
 	::dds_DataWriter* raw =
 	    ::dds_Publisher_create_datawriter(static_cast<::dds_Publisher*>(self), aTopic, qos, aListener, mask);
 	if(raw == nullptr) {
 		return {};
 	}
-	return dds_DataWriter(
-	    detail::MakeRegisteredOwned<DataWriter>(raw, detail::SharedImpl(self), std::shared_ptr<Topic>{}));
+	return dds_DataWriter(detail::MakeRegisteredOwned<DataWriter>(raw, detail::SharedImpl(self), topicOwner));
 }
 
 inline dds_DataWriter dds_Publisher_create_datawriter_w_props(const dds_Publisher& self,
@@ -1309,13 +1329,13 @@ inline dds_DataWriter dds_Publisher_create_datawriter_w_props(const dds_Publishe
     ::dds_StatusMask mask,
     ::dds_StringProperty* props) {
 	auto lifecycleLock = detail::LockLifecycle(detail::SharedImpl(self));
+	auto topicOwner{detail::RegisteredOwner<Topic>(aTopic)};
 	::dds_DataWriter* raw = ::dds_Publisher_create_datawriter_w_props(
 	    static_cast<::dds_Publisher*>(self), aTopic, qos, aListener, mask, props);
 	if(raw == nullptr) {
 		return {};
 	}
-	return dds_DataWriter(
-	    detail::MakeRegisteredOwned<DataWriter>(raw, detail::SharedImpl(self), std::shared_ptr<Topic>{}));
+	return dds_DataWriter(detail::MakeRegisteredOwned<DataWriter>(raw, detail::SharedImpl(self), topicOwner));
 }
 
 inline dds_DataWriter dds_Publisher_create_datawriter_w_profile(const dds_Publisher& self,
@@ -1324,13 +1344,13 @@ inline dds_DataWriter dds_Publisher_create_datawriter_w_profile(const dds_Publis
     const ::dds_DataWriterListener* aListener,
     ::dds_StatusMask mask) {
 	auto lifecycleLock = detail::LockLifecycle(detail::SharedImpl(self));
+	auto topicOwner{detail::RegisteredOwner<Topic>(aTopic)};
 	::dds_DataWriter* raw = ::dds_Publisher_create_datawriter_w_profile(
 	    static_cast<::dds_Publisher*>(self), aTopic, profileName, aListener, mask);
 	if(raw == nullptr) {
 		return {};
 	}
-	return dds_DataWriter(
-	    detail::MakeRegisteredOwned<DataWriter>(raw, detail::SharedImpl(self), std::shared_ptr<Topic>{}));
+	return dds_DataWriter(detail::MakeRegisteredOwned<DataWriter>(raw, detail::SharedImpl(self), topicOwner));
 }
 
 inline ::dds_ReturnCode_t dds_Publisher_delete_datawriter(const dds_Publisher& self, dds_DataWriter& aDatawriter) {
@@ -1340,7 +1360,6 @@ inline ::dds_ReturnCode_t dds_Publisher_delete_datawriter(const dds_Publisher& s
 	}
 	if(detail::SharedImpl(aDatawriter).use_count() > 1)
 		return dds_RETCODE_PRECONDITION_NOT_MET;
-	detail::ClearListener(static_cast<::dds_DataWriter*>(aDatawriter));
 	::dds_ReturnCode_t ret = ::dds_Publisher_delete_datawriter(static_cast<::dds_Publisher*>(self), aDatawriter);
 	if(ret == dds_RETCODE_OK) {
 		*detail::SharedImpl(aDatawriter) = nullptr;
@@ -1433,20 +1452,20 @@ inline dds_DataReader dds_Subscriber_create_datareader(const dds_Subscriber& sel
 	return dds_DataReader(detail::MakeRegisteredOwned<DataReader>(raw, detail::SharedImpl(self), aTopic.GetOwner()));
 }
 
-// Raw topic descriptions are borrowed; no C++ topic owner is retained.
+// 등록된 토픽의 소유권은 토픽 설명 포인터를 통해서도 유지합니다.
 inline dds_DataReader dds_Subscriber_create_datareader(const dds_Subscriber& self,
     const ::dds_TopicDescription* aTopic,
     const ::dds_DataReaderQos* qos,
     const ::dds_DataReaderListener* aListener,
     ::dds_StatusMask mask) {
 	auto lifecycleLock = detail::LockLifecycle(detail::SharedImpl(self));
+	auto topicOwner{detail::RegisteredDescription(aTopic).GetOwner()};
 	::dds_DataReader* raw =
 	    ::dds_Subscriber_create_datareader(static_cast<::dds_Subscriber*>(self), aTopic, qos, aListener, mask);
 	if(raw == nullptr) {
 		return {};
 	}
-	return dds_DataReader(
-	    detail::MakeRegisteredOwned<DataReader>(raw, detail::SharedImpl(self), std::shared_ptr<void>{}));
+	return dds_DataReader(detail::MakeRegisteredOwned<DataReader>(raw, detail::SharedImpl(self), topicOwner));
 }
 
 // Accept the native topic types as well as the common TopicDescription pointer.
@@ -1470,13 +1489,13 @@ inline dds_DataReader dds_Subscriber_create_datareader_w_profile(const dds_Subsc
     const ::dds_DataReaderListener* aListener,
     ::dds_StatusMask mask) {
 	auto lifecycleLock = detail::LockLifecycle(detail::SharedImpl(self));
+	auto topicOwner{detail::RegisteredOwner<Topic>(aTopic)};
 	::dds_DataReader* raw = ::dds_Subscriber_create_datareader_w_profile(
 	    static_cast<::dds_Subscriber*>(self), aTopic, profileName, aListener, mask);
 	if(raw == nullptr) {
 		return {};
 	}
-	return dds_DataReader(
-	    detail::MakeRegisteredOwned<DataReader>(raw, detail::SharedImpl(self), std::shared_ptr<void>{}));
+	return dds_DataReader(detail::MakeRegisteredOwned<DataReader>(raw, detail::SharedImpl(self), topicOwner));
 }
 
 inline ::dds_ReturnCode_t dds_Subscriber_delete_datareader(const dds_Subscriber& self, dds_DataReader& aDatareader) {
@@ -1486,7 +1505,6 @@ inline ::dds_ReturnCode_t dds_Subscriber_delete_datareader(const dds_Subscriber&
 	}
 	if(detail::SharedImpl(aDatareader).use_count() > 1)
 		return dds_RETCODE_PRECONDITION_NOT_MET;
-	detail::ClearListener(static_cast<::dds_DataReader*>(aDatareader));
 	::dds_ReturnCode_t ret = ::dds_Subscriber_delete_datareader(static_cast<::dds_Subscriber*>(self), aDatareader);
 	if(ret == dds_RETCODE_OK) {
 		*detail::SharedImpl(aDatareader) = nullptr;
@@ -1574,6 +1592,8 @@ inline ::dds_ReturnCode_t dds_WaitSet_delete(dds_WaitSet& self) {
 	if(!self) {
 		return detail::BadParameter();
 	}
+	if(detail::SharedImpl(self).use_count() > 1)
+		return dds_RETCODE_PRECONDITION_NOT_MET;
 	::dds_ReturnCode_t ret = ::dds_WaitSet_delete(self);
 	if(ret == dds_RETCODE_OK) {
 		*detail::SharedImpl(self) = nullptr;
@@ -1648,8 +1668,56 @@ inline ::dds_ReturnCode_t dds_WaitSet_detach_condition(const dds_WaitSet& self, 
 
 namespace detail {
 struct DynamicDataAccess;
+struct ResourceAccess;
 struct SequenceItemAccess;
+struct SequenceLoanAccess;
+struct TypeSupportDataAccess;
 struct WriterLoanAccess;
+
+enum class NativeOwnership {
+	Transferable,
+	Dependent,
+	Borrowed
+};
+
+template <typename TDeleter>
+auto GetNativeOwnership(const TDeleter& deleter, int) noexcept -> decltype(deleter.GetNativeOwnership()) {
+	return deleter.GetNativeOwnership();
+}
+
+template <typename TDeleter>
+NativeOwnership GetNativeOwnership(const TDeleter&, ...) noexcept {
+	return NativeOwnership::Transferable;
+}
+
+// 여러 sequence가 하나의 loan을 가리킵니다. 첫 반환에서 전체 loan을 종료합니다.
+struct SequenceLoan {
+	std::shared_ptr<DataReader> m_reader;
+	::dds_DataSeq* m_data{};
+	::dds_DynamicDataSeq* m_dynamicData{};
+	::dds_SampleInfoSeq* m_infos{};
+	::dds_UnsignedLongSeq* m_sizes{};
+	bool m_active{false};
+
+	::dds_ReturnCode_t Finish() noexcept {
+		if(!m_active)
+			return dds_RETCODE_OK;
+
+		::dds_ReturnCode_t ret{};
+		if(m_sizes)
+			ret = ::dds_DataReader_raw_return_loan(**m_reader, m_data, m_infos, m_sizes);
+		else if(m_dynamicData)
+			ret = ::dds_DynamicDataReader_return_loan(**m_reader, m_dynamicData, m_infos);
+		else
+			ret = ::dds_DataReader_return_loan(**m_reader, m_data, m_infos);
+
+		if(ret == dds_RETCODE_OK) {
+			m_active = false;
+			m_reader.reset();
+		}
+		return ret;
+	}
+};
 }
 
 // Move-only owners for sequences, TypeSupport, samples, and dynamic types.
@@ -1658,16 +1726,18 @@ struct WriterLoanAccess;
 template <typename TValue, typename TDeleter>
 class Resource {
 	friend struct detail::DynamicDataAccess;
+	friend struct detail::TypeSupportDataAccess;
+	friend struct detail::ResourceAccess;
+	friend struct detail::SequenceLoanAccess;
 	friend struct detail::SequenceItemAccess;
 	friend struct detail::WriterLoanAccess;
 
 	struct State {
 		TValue* m_raw = nullptr;
 		TDeleter m_deleter;
-		std::function<::dds_ReturnCode_t()> m_beforeDelete;
-		const void* m_loanIdentity = nullptr;
-		const void* m_loanReader = nullptr;
-		detail::OwnerRegistry<State>* m_registry{nullptr};
+		std::shared_ptr<detail::SequenceLoan> m_loan;
+		detail::OwnerRegistry<State>* m_registry{};
+		const void* m_registryKey{};
 		bool m_retainsSequenceItems{false};
 
 		explicit State(TDeleter d)
@@ -1676,8 +1746,8 @@ class Resource {
 
 		~State() noexcept {
 			if(m_raw) {
-				if(m_beforeDelete)
-					detail::TerminateOnError(m_beforeDelete(), "return sequence loan");
+				if(m_loan)
+					detail::TerminateOnError(m_loan->Finish(), "return sequence loan");
 				detail::TerminateOnError(m_deleter(m_raw), "RAII resource cleanup");
 			}
 		}
@@ -1697,7 +1767,7 @@ class Resource {
 
 	void ClearRaw() noexcept {
 		if(m_state->m_registry)
-			m_state->m_registry->m_owners.erase(m_state->m_raw);
+			m_state->m_registry->m_owners.erase(m_state->m_registryKey);
 		m_state->m_raw = nullptr;
 	}
 
@@ -1711,7 +1781,9 @@ class Resource {
 			auto lock{LockOwnerRegistry()};
 			if(m_state.use_count() != 1)
 				return dds_RETCODE_PRECONDITION_NOT_MET;
-			const auto loanRet{FinishLoan()};
+			::dds_ReturnCode_t loanRet{dds_RETCODE_OK};
+			if(m_state->m_loan)
+				loanRet = m_state->m_loan->Finish();
 			if(loanRet != dds_RETCODE_OK)
 				return loanRet;
 			const auto ret{cleanup(m_state->m_raw)};
@@ -1725,6 +1797,7 @@ class Resource {
 
 public:
 	using native_type = TValue;
+	using deleter_type = TDeleter;
 	Resource() noexcept = default;
 	Resource(const Resource&) = delete;
 	Resource& operator=(const Resource&) = delete;
@@ -1732,7 +1805,7 @@ public:
 	Resource& operator=(Resource&&) noexcept = default;
 
 	// Adopts an owning C pointer, never a borrowed get/lookup result.
-	Resource(TValue* raw, TDeleter deleter = TDeleter()) {
+	explicit Resource(TValue* raw, TDeleter deleter = TDeleter()) {
 		if(!raw)
 			return;
 		try {
@@ -1758,7 +1831,9 @@ public:
 	}
 
 	TValue* get() const noexcept {
-		return m_state ? m_state->m_raw : nullptr;
+		if(!m_state)
+			return nullptr;
+		return m_state->m_raw;
 	}
 
 	operator TValue*() const noexcept {
@@ -1790,52 +1865,24 @@ public:
 	}
 
 	const TDeleter* GetDeleter() const noexcept {
-		return m_state ? &m_state->m_deleter : nullptr;
+		if(!m_state)
+			return nullptr;
+		return &m_state->m_deleter;
 	}
 
 	void reset() noexcept {
 		m_state.reset();
 	}
 
-	::dds_ReturnCode_t FinishLoan() noexcept {
-		if(!m_state || !m_state->m_beforeDelete)
-			return dds_RETCODE_OK;
-		const auto ret = m_state->m_beforeDelete();
-		if(ret == dds_RETCODE_OK) {
-			m_state->m_beforeDelete = {};
-			m_state->m_loanIdentity = nullptr;
-			m_state->m_loanReader = nullptr;
-		}
-		return ret;
-	}
-
-	::dds_ReturnCode_t PrepareLoan(
-	    std::function<::dds_ReturnCode_t()> cleanup, const void* identity = nullptr, const void* reader = nullptr) {
-		if(!get())
-			return dds_RETCODE_BAD_PARAMETER;
-		if(m_state->m_retainsSequenceItems)
-			return dds_RETCODE_PRECONDITION_NOT_MET;
-		const auto ret = FinishLoan();
-		if(ret != dds_RETCODE_OK)
-			return ret;
-		m_state->m_beforeDelete = std::move(cleanup);
-		m_state->m_loanIdentity = identity;
-		m_state->m_loanReader = reader;
-		return dds_RETCODE_OK;
-	}
-
-	const void* GetLoanIdentity() const noexcept {
-		return m_state ? m_state->m_loanIdentity : nullptr;
-	}
-
-	const void* GetLoanReader() const noexcept {
-		return m_state ? m_state->m_loanReader : nullptr;
-	}
-
 	TValue* release() {
 		if(!m_state)
 			return nullptr;
-		if(m_state->m_beforeDelete)
+		const auto ownership{detail::GetNativeOwnership(m_state->m_deleter, 0)};
+		if(ownership == detail::NativeOwnership::Borrowed)
+			throw std::logic_error("Cannot release a borrowed DDS resource");
+		if(ownership == detail::NativeOwnership::Dependent)
+			throw std::logic_error("Use the matching raii::dds_* function for a resource with dependencies");
+		if(m_state->m_loan && m_state->m_loan->m_active)
 			throw std::logic_error("Return the sequence loan before release()");
 		if(m_state->m_retainsSequenceItems)
 			throw std::logic_error("DDS sequence retains its items");
@@ -1866,6 +1913,83 @@ public:
 	}
 };
 
+namespace detail {
+struct ResourceAccess {
+	template <typename TResource, typename TAllocate, typename TDeleter = typename TResource::deleter_type>
+	static TResource Create(TAllocate allocate, TDeleter cleanup = TDeleter()) {
+		auto value{TResource::Create(allocate, std::move(cleanup))};
+		Register(value, value.get());
+		return value;
+	}
+
+	template <typename TResource>
+	static void Register(TResource& value, const void* key) {
+		if(!value || !key)
+			return;
+
+		auto& registry{GetOwnerRegistry<typename TResource::State>()};
+		value.m_state->m_registryKey = key;
+		RegisterOwner(key, value.m_state);
+		value.m_state->m_registry = &registry;
+	}
+
+	template <typename TResource>
+	static TResource Lookup(const void* key) {
+		TResource value;
+		if(!key)
+			return value;
+
+		auto& registry{GetOwnerRegistry<typename TResource::State>()};
+		std::lock_guard<std::mutex> lock(registry.m_mutex);
+		auto it{registry.m_owners.find(key)};
+		if(it == registry.m_owners.end())
+			return value;
+
+		value.m_state = it->second.lock();
+		if(!value)
+			registry.m_owners.erase(it);
+		return value;
+	}
+};
+
+struct SequenceLoanAccess {
+	template <typename TSequence>
+	static std::shared_ptr<SequenceLoan> Active(const TSequence& sequence) noexcept {
+		if(!sequence.m_state || !sequence.m_state->m_loan || !sequence.m_state->m_loan->m_active)
+			return {};
+		return sequence.m_state->m_loan;
+	}
+
+	template <typename TSequence>
+	static std::shared_ptr<SequenceLoan> Active(typename TSequence::native_type* raw) {
+		auto sequence{ResourceAccess::Lookup<TSequence>(raw)};
+		return Active(sequence);
+	}
+
+	template <typename TSequence>
+	static ::dds_ReturnCode_t Prepare(TSequence& sequence) {
+		if(sequence.m_state->m_retainsSequenceItems)
+			return dds_RETCODE_PRECONDITION_NOT_MET;
+		if(!sequence.m_state->m_registry)
+			ResourceAccess::Register(sequence, sequence.get());
+		return dds_RETCODE_OK;
+	}
+
+	template <typename TSequence>
+	static ::dds_ReturnCode_t Finish(TSequence& sequence) noexcept {
+		auto loan{Active(sequence)};
+		if(!loan)
+			return dds_RETCODE_OK;
+		return loan->Finish();
+	}
+
+	template <typename TSequence>
+	static void Commit(TSequence& sequence, const std::shared_ptr<SequenceLoan>& loan) noexcept {
+		sequence.m_state->m_loan = loan;
+	}
+};
+} // namespace detail
+
 // Expand at global scope after including the generated TypeSupport header.
 // Only sample allocation, deserialization and release are wrapped. The generated
 // TypeSupport singleton remains borrowed and the generated C files stay intact.
@@ -1889,7 +2013,7 @@ public:
 	}                                                                                                                  \
 	}
 
-#define RAII_SEQUENCE_DEFINE(seq_type)                                                                                 \
+#define RAII_SEQUENCE_DEFINE(seq_type, check_loan)                                                                     \
 	struct seq_type##_deleter {                                                                                        \
 		::dds_ReturnCode_t operator()(::seq_type* raw) const noexcept {                                                \
 			::seq_type##_delete(raw);                                                                                  \
@@ -1901,40 +2025,42 @@ public:
 		return seq_type::Create([=]() { return ::seq_type##_create(capacity); });                                      \
 	}                                                                                                                  \
 	inline seq_type seq_type##_clone(::seq_type* sequence) {                                                           \
+		if(check_loan && detail::SequenceLoanAccess::Active<seq_type>(sequence))                                       \
+			return {};                                                                                                 \
 		return seq_type::Create([=]() { return ::seq_type##_clone(sequence); });                                       \
 	}                                                                                                                  \
 	inline void seq_type##_delete(seq_type& sequence) noexcept {                                                       \
 		sequence.reset();                                                                                              \
 	}
 
-RAII_SEQUENCE_DEFINE(dds_InstanceHandleSeq)
-RAII_SEQUENCE_DEFINE(dds_QosPolicyCountSeq)
-RAII_SEQUENCE_DEFINE(dds_DataReaderSeq)
-RAII_SEQUENCE_DEFINE(dds_DataWriterSeq)
-RAII_SEQUENCE_DEFINE(dds_ConditionSeq)
-RAII_SEQUENCE_DEFINE(dds_SampleInfoSeq)
-RAII_SEQUENCE_DEFINE(dds_DataSeq)
-RAII_SEQUENCE_DEFINE(dds_DataRepresentationIdSeq)
-RAII_SEQUENCE_DEFINE(dds_PropertySeq)
-RAII_SEQUENCE_DEFINE(dds_TagSeq)
-RAII_SEQUENCE_DEFINE(dds_BinaryPropertySeq)
-RAII_SEQUENCE_DEFINE(dds_CharSeq)
-RAII_SEQUENCE_DEFINE(dds_StringSeq)
-RAII_SEQUENCE_DEFINE(dds_WcharSeq)
-RAII_SEQUENCE_DEFINE(dds_WstringSeq)
-RAII_SEQUENCE_DEFINE(dds_OctetSeq)
-RAII_SEQUENCE_DEFINE(dds_ShortSeq)
-RAII_SEQUENCE_DEFINE(dds_UnsignedShortSeq)
-RAII_SEQUENCE_DEFINE(dds_LongSeq)
-RAII_SEQUENCE_DEFINE(dds_UnsignedLongSeq)
-RAII_SEQUENCE_DEFINE(dds_LongLongSeq)
-RAII_SEQUENCE_DEFINE(dds_UnsignedLongLongSeq)
-RAII_SEQUENCE_DEFINE(dds_FloatSeq)
-RAII_SEQUENCE_DEFINE(dds_DoubleSeq)
-RAII_SEQUENCE_DEFINE(dds_BooleanSeq)
-RAII_SEQUENCE_DEFINE(dds_KeyedStringSeq)
-RAII_SEQUENCE_DEFINE(dds_BytesSeq)
-RAII_SEQUENCE_DEFINE(dds_KeyedBytesSeq)
+RAII_SEQUENCE_DEFINE(dds_InstanceHandleSeq, false)
+RAII_SEQUENCE_DEFINE(dds_QosPolicyCountSeq, false)
+RAII_SEQUENCE_DEFINE(dds_DataReaderSeq, false)
+RAII_SEQUENCE_DEFINE(dds_DataWriterSeq, false)
+RAII_SEQUENCE_DEFINE(dds_ConditionSeq, false)
+RAII_SEQUENCE_DEFINE(dds_SampleInfoSeq, true)
+RAII_SEQUENCE_DEFINE(dds_DataSeq, true)
+RAII_SEQUENCE_DEFINE(dds_DataRepresentationIdSeq, false)
+RAII_SEQUENCE_DEFINE(dds_PropertySeq, false)
+RAII_SEQUENCE_DEFINE(dds_TagSeq, false)
+RAII_SEQUENCE_DEFINE(dds_BinaryPropertySeq, false)
+RAII_SEQUENCE_DEFINE(dds_CharSeq, false)
+RAII_SEQUENCE_DEFINE(dds_StringSeq, false)
+RAII_SEQUENCE_DEFINE(dds_WcharSeq, false)
+RAII_SEQUENCE_DEFINE(dds_WstringSeq, false)
+RAII_SEQUENCE_DEFINE(dds_OctetSeq, false)
+RAII_SEQUENCE_DEFINE(dds_ShortSeq, false)
+RAII_SEQUENCE_DEFINE(dds_UnsignedShortSeq, false)
+RAII_SEQUENCE_DEFINE(dds_LongSeq, false)
+RAII_SEQUENCE_DEFINE(dds_UnsignedLongSeq, false)
+RAII_SEQUENCE_DEFINE(dds_LongLongSeq, false)
+RAII_SEQUENCE_DEFINE(dds_UnsignedLongLongSeq, false)
+RAII_SEQUENCE_DEFINE(dds_FloatSeq, false)
+RAII_SEQUENCE_DEFINE(dds_DoubleSeq, false)
+RAII_SEQUENCE_DEFINE(dds_BooleanSeq, false)
+RAII_SEQUENCE_DEFINE(dds_KeyedStringSeq, false)
+RAII_SEQUENCE_DEFINE(dds_BytesSeq, false)
+RAII_SEQUENCE_DEFINE(dds_KeyedBytesSeq, false)
 #undef RAII_SEQUENCE_DEFINE
 
 struct dds_DynamicDataSeq_deleter {
@@ -1955,6 +2081,83 @@ inline dds_DynamicDataSeq dds_DynamicDataSeq_create(uint32_t capacity) {
 inline void dds_DynamicDataSeq_delete(dds_DynamicDataSeq& sequence) noexcept {
 	sequence.reset();
 }
+
+namespace detail {
+template <typename TValue>
+::dds_ReturnCode_t CheckScopedOutput(TValue*, ::dds_ReturnCode_t ret) noexcept {
+	return ret;
+}
+
+inline ::dds_ReturnCode_t CheckScopedOutput(::dds_DomainParticipantQos* qos, ::dds_ReturnCode_t ret) noexcept {
+	// C 복사가 첫 필드에서 실패하면 뒤 필드에는 원본 주소가 남습니다.
+	if(!qos->property.value)
+		qos->property.binary_value = nullptr;
+	if(ret == dds_RETCODE_OK && !qos->property.binary_value)
+		return dds_RETCODE_ERROR;
+	return ret;
+}
+
+template <typename TQos>
+::dds_ReturnCode_t CheckEndpointQos(TQos* qos, ::dds_ReturnCode_t ret) noexcept {
+	if(!qos->data_representation.value)
+		qos->property.value = nullptr;
+	if(!qos->property.value)
+		qos->property.binary_value = nullptr;
+	if(!qos->property.binary_value)
+		qos->data_tags.tags = nullptr;
+	if(ret == dds_RETCODE_OK && !qos->data_tags.tags)
+		return dds_RETCODE_ERROR;
+	return ret;
+}
+
+inline ::dds_ReturnCode_t CheckScopedOutput(::dds_DataWriterQos* qos, ::dds_ReturnCode_t ret) noexcept {
+	return CheckEndpointQos(qos, ret);
+}
+
+inline ::dds_ReturnCode_t CheckScopedOutput(::dds_DataReaderQos* qos, ::dds_ReturnCode_t ret) noexcept {
+	return CheckEndpointQos(qos, ret);
+}
+
+inline ::dds_ReturnCode_t CheckScopedOutput(::dds_TypeDescriptor* descriptor, ::dds_ReturnCode_t ret) noexcept {
+	// C TypeDescriptor 복사는 오류 시 내부 필드를 해제한 뒤 포인터를 그대로 둡니다.
+	if(ret != dds_RETCODE_OK)
+		*descriptor = {};
+	return ret;
+}
+
+template <typename TValue>
+const typename TValue::native_type* GetScopedInput(const TValue* value) noexcept {
+	if(!value)
+		return nullptr;
+	return *value;
+}
+
+template <typename TValue>
+const typename TValue::native_type* GetScopedInput(const typename TValue::native_type* value) noexcept {
+	return value;
+}
+
+template <typename TValue>
+const typename TValue::native_type* GetScopedInput(std::nullptr_t) noexcept {
+	return nullptr;
+}
+
+template <typename TValue>
+const typename TValue::native_type* GetScopedInput(const TValue& value) noexcept {
+	return value;
+}
+
+template <typename TValue, typename TPopulate>
+::dds_ReturnCode_t ReplaceScopedValue(TValue& destination, TPopulate populate) noexcept {
+	TValue next;
+	auto* raw{static_cast<typename TValue::native_type*>(next)};
+	const auto nativeRet{populate(raw)};
+	const auto ret{CheckScopedOutput(raw, nativeRet)};
+	if(ret == dds_RETCODE_OK)
+		destination = std::move(next);
+	return ret;
+}
+} // namespace detail
 
 #define RAII_QOS_DEFINE(qos_type)                                                                                      \
 	class qos_type {                                                                                                   \
@@ -2009,26 +2212,26 @@ inline void dds_DynamicDataSeq_delete(dds_DynamicDataSeq& sequence) noexcept {
 		return ret;                                                                                                    \
 	}                                                                                                                  \
                                                                                                                        \
-	inline ::dds_ReturnCode_t qos_type##_copy(qos_type& dst, const qos_type& src) noexcept {                           \
-		if(&dst == &src) {                                                                                             \
-			return dds_RETCODE_OK;                                                                                     \
-		}                                                                                                              \
-		(void)::qos_type##_finalize(dst);                                                                              \
-		return ::qos_type##_copy(dst, src);                                                                            \
-	}                                                                                                                  \
-                                                                                                                       \
-	inline ::dds_ReturnCode_t qos_type##_copy(qos_type& dst, const typename qos_type::native_type* src) noexcept {     \
-		if(src == nullptr) {                                                                                           \
+	inline ::dds_ReturnCode_t qos_type##_copy(qos_type& dst, const ::qos_type* src) noexcept {                         \
+		if(!src)                                                                                                       \
 			return dds_RETCODE_BAD_PARAMETER;                                                                          \
-		}                                                                                                              \
-                                                                                                                       \
-		const typename qos_type::native_type* dst_ptr = dst;                                                           \
-		if(src == dst_ptr) {                                                                                           \
+		if(static_cast<const ::qos_type*>(dst) == src)                                                                 \
 			return dds_RETCODE_OK;                                                                                     \
-		}                                                                                                              \
-                                                                                                                       \
-		(void)::qos_type##_finalize(dst);                                                                              \
-		return ::qos_type##_copy(dst, src);                                                                            \
+		return detail::ReplaceScopedValue(dst, [src](::qos_type* next) { return ::qos_type##_copy(next, src); });      \
+	}                                                                                                                  \
+	inline ::dds_ReturnCode_t qos_type##_copy(qos_type& dst, const qos_type& src) noexcept {                           \
+		return raii::qos_type##_copy(dst, static_cast<const ::qos_type*>(src));                                        \
+	}                                                                                                                  \
+	inline ::dds_ReturnCode_t qos_type##_finalize(qos_type* value) noexcept {                                          \
+		if(!value)                                                                                                     \
+			return dds_RETCODE_BAD_PARAMETER;                                                                          \
+		return raii::qos_type##_finalize(*value);                                                                      \
+	}                                                                                                                  \
+	template <typename TSource>                                                                                        \
+	inline ::dds_ReturnCode_t qos_type##_copy(qos_type* dst, const TSource& src) noexcept {                            \
+		if(!dst)                                                                                                       \
+			return dds_RETCODE_BAD_PARAMETER;                                                                          \
+		return raii::qos_type##_copy(*dst, detail::GetScopedInput<qos_type>(src));                                     \
 	}
 
 // Expand the RAII QoS macros.
@@ -2044,8 +2247,12 @@ RAII_QOS_DEFINE(dds_DataReaderQos)
 
 #define RAII_QOS_OUT_API_DEFINE(c_api_name, entity_type, qos_type)                                                     \
 	inline ::dds_ReturnCode_t c_api_name(::entity_type* self, qos_type& qos) noexcept {                                \
-		(void)::qos_type##_finalize(qos);                                                                              \
-		return ::c_api_name(self, qos);                                                                                \
+		return detail::ReplaceScopedValue(qos, [self](::qos_type* next) { return ::c_api_name(self, next); });         \
+	}                                                                                                                  \
+	inline ::dds_ReturnCode_t c_api_name(::entity_type* self, qos_type* qos) noexcept {                                \
+		if(!qos)                                                                                                       \
+			return dds_RETCODE_BAD_PARAMETER;                                                                          \
+		return raii::c_api_name(self, *qos);                                                                           \
 	}
 
 RAII_QOS_OUT_API_DEFINE(dds_DomainParticipant_get_qos, dds_DomainParticipant, dds_DomainParticipantQos)
@@ -2078,52 +2285,111 @@ RAII_QOS_OUT_API_DEFINE(dds_DataReader_get_qos, dds_DataReader, dds_DataReaderQo
 
 #undef RAII_QOS_OUT_API_DEFINE
 
-// The C copy_from_topic_qos replaces only shared policies and frees the old
-// representation sequence itself; retain endpoint-only QoS policies.
-inline ::dds_ReturnCode_t dds_Publisher_copy_from_topic_qos(
-    ::dds_Publisher* self, dds_DataWriterQos& datawriterQos, const dds_TopicQos& topicQos) noexcept {
-	return ::dds_Publisher_copy_from_topic_qos(self, datawriterQos, topicQos);
+namespace detail {
+template <typename TEntity, typename TQos, typename TCopy>
+::dds_ReturnCode_t CopyFromTopicQos(TEntity* self, TQos& qos, const ::dds_TopicQos* topic, TCopy copy) noexcept {
+	if(!topic)
+		return dds_RETCODE_BAD_PARAMETER;
+
+	// 엔드포인트 전용 정책은 빌리고 C 복사가 교체하는 representation만 분리합니다.
+	using TRaw = typename TQos::native_type;
+	auto* destination{static_cast<TRaw*>(qos)};
+	TRaw next{*destination};
+	next.data_representation.value = nullptr;
+	const auto ret{copy(self, &next, topic)};
+	if(ret != dds_RETCODE_OK) {
+		::dds_DataRepresentationIdSeq_delete(next.data_representation.value);
+		return ret;
+	}
+
+	::dds_DataRepresentationIdSeq_delete(destination->data_representation.value);
+	*destination = next;
+	return ret;
 }
+} // namespace detail
 
 inline ::dds_ReturnCode_t dds_Publisher_copy_from_topic_qos(
     ::dds_Publisher* self, dds_DataWriterQos& datawriterQos, const ::dds_TopicQos* topicQos) noexcept {
-	if(topicQos == nullptr) {
-		return dds_RETCODE_BAD_PARAMETER;
-	}
-
-	return ::dds_Publisher_copy_from_topic_qos(self, datawriterQos, topicQos);
+	return detail::CopyFromTopicQos(self, datawriterQos, topicQos, ::dds_Publisher_copy_from_topic_qos);
 }
 
-inline ::dds_ReturnCode_t dds_Subscriber_copy_from_topic_qos(
-    ::dds_Subscriber* self, dds_DataReaderQos& datareaderQos, const dds_TopicQos& topicQos) noexcept {
-	return ::dds_Subscriber_copy_from_topic_qos(self, datareaderQos, topicQos);
+inline ::dds_ReturnCode_t dds_Publisher_copy_from_topic_qos(
+    ::dds_Publisher* self, dds_DataWriterQos& datawriterQos, const dds_TopicQos& topicQos) noexcept {
+	return raii::dds_Publisher_copy_from_topic_qos(self, datawriterQos, static_cast<const ::dds_TopicQos*>(topicQos));
+}
+
+template <typename TTopicQos>
+inline ::dds_ReturnCode_t dds_Publisher_copy_from_topic_qos(
+    ::dds_Publisher* self, dds_DataWriterQos* qos, const TTopicQos& topicQos) noexcept {
+	if(!qos)
+		return dds_RETCODE_BAD_PARAMETER;
+	return raii::dds_Publisher_copy_from_topic_qos(self, *qos, detail::GetScopedInput<dds_TopicQos>(topicQos));
 }
 
 inline ::dds_ReturnCode_t dds_Subscriber_copy_from_topic_qos(
     ::dds_Subscriber* self, dds_DataReaderQos& datareaderQos, const ::dds_TopicQos* topicQos) noexcept {
-	if(topicQos == nullptr) {
-		return dds_RETCODE_BAD_PARAMETER;
-	}
+	return detail::CopyFromTopicQos(self, datareaderQos, topicQos, ::dds_Subscriber_copy_from_topic_qos);
+}
 
-	return ::dds_Subscriber_copy_from_topic_qos(self, datareaderQos, topicQos);
+inline ::dds_ReturnCode_t dds_Subscriber_copy_from_topic_qos(
+    ::dds_Subscriber* self, dds_DataReaderQos& datareaderQos, const dds_TopicQos& topicQos) noexcept {
+	return raii::dds_Subscriber_copy_from_topic_qos(self, datareaderQos, static_cast<const ::dds_TopicQos*>(topicQos));
+}
+
+template <typename TTopicQos>
+inline ::dds_ReturnCode_t dds_Subscriber_copy_from_topic_qos(
+    ::dds_Subscriber* self, dds_DataReaderQos* qos, const TTopicQos& topicQos) noexcept {
+	if(!qos)
+		return dds_RETCODE_BAD_PARAMETER;
+	return raii::dds_Subscriber_copy_from_topic_qos(self, *qos, detail::GetScopedInput<dds_TopicQos>(topicQos));
 }
 
 inline ::dds_ReturnCode_t dds_DomainParticipantFactory_get_participant_qos_from_profile(
     const char* profileName, dds_DomainParticipantQos& qos) noexcept {
-	(void)::dds_DomainParticipantQos_finalize(qos);
-	return ::dds_DomainParticipantFactory_get_participant_qos_from_profile(profileName, qos);
+	if(!profileName)
+		return dds_RETCODE_BAD_PARAMETER;
+	return detail::ReplaceScopedValue(qos, [profileName](::dds_DomainParticipantQos* next) {
+		return ::dds_DomainParticipantFactory_get_participant_qos_from_profile(profileName, next);
+	});
+}
+
+inline ::dds_ReturnCode_t dds_DomainParticipantFactory_get_participant_qos_from_profile(
+    const char* profileName, dds_DomainParticipantQos* qos) noexcept {
+	if(!qos)
+		return dds_RETCODE_BAD_PARAMETER;
+	return raii::dds_DomainParticipantFactory_get_participant_qos_from_profile(profileName, *qos);
 }
 
 inline ::dds_ReturnCode_t dds_DomainParticipantFactory_get_datawriter_qos_from_profile(
     const char* profileName, dds_DataWriterQos& qos) noexcept {
-	(void)::dds_DataWriterQos_finalize(qos);
-	return ::dds_DomainParticipantFactory_get_datawriter_qos_from_profile(profileName, qos);
+	if(!profileName)
+		return dds_RETCODE_BAD_PARAMETER;
+	return detail::ReplaceScopedValue(qos, [profileName](::dds_DataWriterQos* next) {
+		return ::dds_DomainParticipantFactory_get_datawriter_qos_from_profile(profileName, next);
+	});
+}
+
+inline ::dds_ReturnCode_t dds_DomainParticipantFactory_get_datawriter_qos_from_profile(
+    const char* profileName, dds_DataWriterQos* qos) noexcept {
+	if(!qos)
+		return dds_RETCODE_BAD_PARAMETER;
+	return raii::dds_DomainParticipantFactory_get_datawriter_qos_from_profile(profileName, *qos);
 }
 
 inline ::dds_ReturnCode_t dds_DomainParticipantFactory_get_datareader_qos_from_profile(
     const char* profileName, dds_DataReaderQos& qos) noexcept {
-	(void)::dds_DataReaderQos_finalize(qos);
-	return ::dds_DomainParticipantFactory_get_datareader_qos_from_profile(profileName, qos);
+	if(!profileName)
+		return dds_RETCODE_BAD_PARAMETER;
+	return detail::ReplaceScopedValue(qos, [profileName](::dds_DataReaderQos* next) {
+		return ::dds_DomainParticipantFactory_get_datareader_qos_from_profile(profileName, next);
+	});
+}
+
+inline ::dds_ReturnCode_t dds_DomainParticipantFactory_get_datareader_qos_from_profile(
+    const char* profileName, dds_DataReaderQos* qos) noexcept {
+	if(!qos)
+		return dds_RETCODE_BAD_PARAMETER;
+	return raii::dds_DomainParticipantFactory_get_datareader_qos_from_profile(profileName, *qos);
 }
 
 #define RAII_DESCRIPTOR_DEFINE(type)                                                                                   \
@@ -2172,11 +2438,21 @@ inline ::dds_ReturnCode_t dds_DomainParticipantFactory_get_datareader_qos_from_p
 			return dds_RETCODE_BAD_PARAMETER;                                                                          \
 		if(static_cast<const ::type*>(dst) == src)                                                                     \
 			return dds_RETCODE_OK;                                                                                     \
-		(void)::type##_finalize(dst);                                                                                  \
-		return ::type##_copy_from(dst, src);                                                                           \
+		return detail::ReplaceScopedValue(dst, [src](::type* next) { return ::type##_copy_from(next, src); });         \
 	}                                                                                                                  \
 	inline ::dds_ReturnCode_t type##_copy_from(type& dst, const type& src) noexcept {                                  \
 		return raii::type##_copy_from(dst, static_cast<const ::type*>(src));                                           \
+	}                                                                                                                  \
+	inline ::dds_ReturnCode_t type##_finalize(type* value) noexcept {                                                  \
+		if(!value)                                                                                                     \
+			return dds_RETCODE_BAD_PARAMETER;                                                                          \
+		return raii::type##_finalize(*value);                                                                          \
+	}                                                                                                                  \
+	template <typename TSource>                                                                                        \
+	inline ::dds_ReturnCode_t type##_copy_from(type* dst, const TSource& src) noexcept {                               \
+		if(!dst)                                                                                                       \
+			return dds_RETCODE_BAD_PARAMETER;                                                                          \
+		return raii::type##_copy_from(*dst, detail::GetScopedInput<type>(src));                                        \
 	}
 RAII_DESCRIPTOR_DEFINE(dds_TypeDescriptor)
 RAII_DESCRIPTOR_DEFINE(dds_MemberDescriptor)
@@ -2213,35 +2489,54 @@ inline ::dds_ReturnCode_t dds_DynamicTypeSupport_delete_type_support(dds_Dynamic
 }
 
 struct dds_DynamicType_deleter {
-	::dds_DynamicTypeBuilderFactory* factory = nullptr;
+	::dds_DynamicTypeBuilderFactory* m_factory{};
+	std::shared_ptr<void> m_supportOwner;
 
-	explicit dds_DynamicType_deleter(::dds_DynamicTypeBuilderFactory* f = nullptr)
-	    : factory(f) {
+	explicit dds_DynamicType_deleter(::dds_DynamicTypeBuilderFactory* factory = nullptr) noexcept
+	    : m_factory(factory) {
+	}
+
+	detail::NativeOwnership GetNativeOwnership() const noexcept {
+		if(m_supportOwner)
+			return detail::NativeOwnership::Borrowed;
+		return detail::NativeOwnership::Transferable;
 	}
 
 	::dds_ReturnCode_t operator()(::dds_DynamicType* raw) const noexcept {
-		return ::dds_DynamicTypeBuilderFactory_delete_type(
-		    factory ? factory : ::dds_DynamicTypeBuilderFactory_get_instance(), raw);
+		if(m_supportOwner)
+			return dds_RETCODE_OK;
+		auto* factory{m_factory};
+		if(!factory)
+			factory = ::dds_DynamicTypeBuilderFactory_get_instance();
+		return ::dds_DynamicTypeBuilderFactory_delete_type(factory, raw);
 	}
 };
 
 using dds_DynamicType = Resource<::dds_DynamicType, dds_DynamicType_deleter>;
 
 struct dds_DynamicData_deleter {
-	::dds_DynamicDataFactory* factory = nullptr;
-	::dds_DynamicData* parent = nullptr;
-	std::shared_ptr<void> parent_owner;
-	std::shared_ptr<void> type_owner;
-	dds_DynamicData_deleter() = default;
+	::dds_DynamicDataFactory* m_factory{};
+	::dds_DynamicData* m_parent{};
+	std::shared_ptr<void> m_parentOwner;
+	std::shared_ptr<void> m_typeOwner;
 
-	explicit dds_DynamicData_deleter(::dds_DynamicDataFactory* f)
-	    : factory(f) {
+	explicit dds_DynamicData_deleter(::dds_DynamicDataFactory* factory = nullptr) noexcept
+	    : m_factory(factory) {
+	}
+
+	detail::NativeOwnership GetNativeOwnership() const noexcept {
+		if(m_parent || m_typeOwner)
+			return detail::NativeOwnership::Dependent;
+		return detail::NativeOwnership::Transferable;
 	}
 
 	::dds_ReturnCode_t operator()(::dds_DynamicData* raw) const noexcept {
-		return parent ? ::dds_DynamicData_return_loaned_value(parent, raw)
-		              : ::dds_DynamicDataFactory_delete_data(
-		                    factory ? factory : ::dds_DynamicDataFactory_get_instance(), raw);
+		if(m_parent)
+			return ::dds_DynamicData_return_loaned_value(m_parent, raw);
+		auto* factory{m_factory};
+		if(!factory)
+			factory = ::dds_DynamicDataFactory_get_instance();
+		return ::dds_DynamicDataFactory_delete_data(factory, raw);
 	}
 };
 
@@ -2249,39 +2544,54 @@ using dds_DynamicData = Resource<::dds_DynamicData, dds_DynamicData_deleter>;
 
 namespace detail {
 struct DynamicDataAccess {
-	template <typename TResource>
-	static TResource Register(TResource value) {
-		if(value) {
-			value.m_state->m_registry = &GetOwnerRegistry<typename TResource::State>();
-			RegisterOwner(value.get(), value.m_state);
-		}
-		return value;
+	template <typename TAllocate>
+	static dds_DynamicTypeSupport CreateSupport(TAllocate allocate) {
+		auto support{dds_DynamicTypeSupport::Create(allocate)};
+		if(support)
+			ResourceAccess::Register(support, ::dds_DynamicTypeSupport_get_dynamictype(support.get()));
+		return support;
 	}
 
-	template <typename TResource, typename TRaw>
-	static TResource Lookup(TRaw* raw) {
-		TResource value;
-		value.m_state = RegisteredOwner<typename TResource::State>(raw);
-		return value;
+	static std::shared_ptr<void> GetTypeOwner(const ::dds_DynamicType* type) {
+		auto owner{ResourceAccess::Lookup<dds_DynamicType>(type)};
+		if(owner)
+			return owner.GetOwner();
+		return ResourceAccess::Lookup<dds_DynamicTypeSupport>(type).GetOwner();
 	}
 
-	static dds_DynamicData Loan(::dds_DynamicData* parent, ::dds_MemberId_t id, std::shared_ptr<void> parentOwner) {
+	static std::shared_ptr<void> GetTypeOwner(const dds_DynamicType& type) noexcept {
+		const auto* cleanup{type.GetDeleter()};
+		if(cleanup && cleanup->m_supportOwner)
+			return cleanup->m_supportOwner;
+		return type.GetOwner();
+	}
+
+	static std::shared_ptr<void> GetTypeOwner(const dds_DynamicData& data) noexcept {
+		auto* cleanup{data.GetDeleter()};
+		if(!cleanup)
+			return {};
+		return cleanup->m_typeOwner;
+	}
+
+	template <typename TAllocate>
+	static dds_DynamicData Loan(const dds_DynamicData& owner, ::dds_DynamicData* parent, TAllocate allocate) {
 		if(!parent)
 			return {};
 
 		dds_DynamicData_deleter cleanup;
-		cleanup.parent = parent;
-		cleanup.parent_owner = std::move(parentOwner);
-		return dds_DynamicData::Create(
-		    [&]() { return ::dds_DynamicData_loan_value(parent, id); }, std::move(cleanup));
+		cleanup.m_parent = parent;
+		cleanup.m_parentOwner = owner.GetOwner();
+		cleanup.m_typeOwner = GetTypeOwner(owner);
+		return ResourceAccess::Create<dds_DynamicData>(allocate, std::move(cleanup));
 	}
 
 	static dds_DynamicData Clone(::dds_DynamicData* raw, std::shared_ptr<void> typeOwner) {
 		if(!raw)
 			return {};
 		dds_DynamicData_deleter cleanup;
-		cleanup.type_owner = std::move(typeOwner);
-		return Register(dds_DynamicData::Create([raw]() { return ::dds_DynamicData_clone(raw); }, std::move(cleanup)));
+		cleanup.m_typeOwner = std::move(typeOwner);
+		return ResourceAccess::Create<dds_DynamicData>(
+		    [raw]() { return ::dds_DynamicData_clone(raw); }, std::move(cleanup));
 	}
 
 	static dds_DynamicDataSeq CloneSequence(::dds_DynamicDataSeq* raw, const std::shared_ptr<DataReader>& reader) {
@@ -2299,8 +2609,12 @@ struct DynamicDataAccess {
 
 		for(uint32_t index{}; index < count; ++index) {
 			auto* item{static_cast<::dds_DynamicData*>(::dds_DynamicDataSeq_get(raw, index))};
-			// Returning a reader loan frees its samples. Copy those samples and retain their type via the reader.
-			auto value{reader ? Clone(item, reader) : Lookup<dds_DynamicData>(item)};
+			dds_DynamicData value;
+			// Reader loan 반환 후에도 복제본에서 타입을 사용하므로 Reader를 유지합니다.
+			if(reader)
+				value = Clone(item, reader);
+			else
+				value = ResourceAccess::Lookup<dds_DynamicData>(item);
 			if(item && !value)
 				return {};
 			if(!::dds_DynamicDataSeq_add(result.get(), value.get()))
@@ -2313,25 +2627,35 @@ struct DynamicDataAccess {
 	}
 
 	static ::dds_ReturnCode_t Delete(::dds_DynamicTypeBuilderFactory* factory, dds_DynamicType& type) noexcept {
+		if(auto* cleanup = type.GetDeleter()) {
+			if(cleanup->m_supportOwner || (cleanup->m_factory && cleanup->m_factory != factory))
+				return dds_RETCODE_PRECONDITION_NOT_MET;
+		}
 		return type.CloseWith([factory](::dds_DynamicType* raw) {
 			return ::dds_DynamicTypeBuilderFactory_delete_type(factory, raw);
 		});
 	}
 
 	static ::dds_ReturnCode_t Delete(::dds_DynamicDataFactory* factory, dds_DynamicData& data) noexcept {
+		const auto* cleanup{data.GetDeleter()};
+		if(!cleanup)
+			return dds_RETCODE_BAD_PARAMETER;
+		if(cleanup->m_parent || (cleanup->m_factory && cleanup->m_factory != factory))
+			return dds_RETCODE_PRECONDITION_NOT_MET;
 		return data.CloseWith(
 		    [factory](::dds_DynamicData* raw) { return ::dds_DynamicDataFactory_delete_data(factory, raw); });
 	}
 };
 } // namespace detail
 
-// Shares ownership of data registered by the RAII creation and clone functions.
 inline dds_DynamicData dds_DynamicData_lookup(::dds_DynamicData* raw) {
-	return detail::DynamicDataAccess::Lookup<dds_DynamicData>(raw);
+	return detail::ResourceAccess::Lookup<dds_DynamicData>(raw);
 }
 
-// Native sequences can share only items with registered owners.
 inline dds_DynamicDataSeq dds_DynamicDataSeq_clone(::dds_DynamicDataSeq* sequence) {
+	auto loan{detail::SequenceLoanAccess::Active<dds_DynamicDataSeq>(sequence)};
+	if(loan)
+		return detail::DynamicDataAccess::CloneSequence(sequence, loan->m_reader);
 	return detail::DynamicDataAccess::CloneSequence(sequence, {});
 }
 
@@ -2342,35 +2666,77 @@ inline ::dds_ReturnCode_t dds_DynamicTypeBuilderFactory_delete_type(
 
 inline ::dds_ReturnCode_t dds_DynamicDataFactory_delete_data(
     ::dds_DynamicDataFactory* self, dds_DynamicData& data) noexcept {
-	if(!data)
-		return dds_RETCODE_BAD_PARAMETER;
-	if(data.GetDeleter()->parent)
-		return dds_RETCODE_PRECONDITION_NOT_MET;
 	return detail::DynamicDataAccess::Delete(self, data);
 }
 
 inline dds_DynamicData dds_DynamicData_loan_value(const dds_DynamicData& self, ::dds_MemberId_t id) {
-	return detail::DynamicDataAccess::Loan(self.get(), id, self.GetOwner());
+	return detail::DynamicDataAccess::Loan(
+	    self, self.get(), [&]() { return ::dds_DynamicData_loan_value(self.get(), id); });
 }
 
-// Pass a live parent. If it has no registered owner, keep it alive until the loan is returned.
 inline dds_DynamicData dds_DynamicData_loan_value(::dds_DynamicData* self, ::dds_MemberId_t id) {
-	auto parent{dds_DynamicData_lookup(self)};
-	return detail::DynamicDataAccess::Loan(self, id, parent.GetOwner());
+	auto parent{raii::dds_DynamicData_lookup(self)};
+	return detail::DynamicDataAccess::Loan(parent, self, [=]() { return ::dds_DynamicData_loan_value(self, id); });
+}
+
+namespace detail {
+inline ::dds_ReturnCode_t GetComplexValue(
+    ::dds_DynamicData* self, const dds_DynamicData& owner, dds_DynamicData& value, ::dds_MemberId_t id) {
+	if(!self)
+		return dds_RETCODE_BAD_PARAMETER;
+	if(owner && owner.GetOwner() == value.GetOwner())
+		return dds_RETCODE_PRECONDITION_NOT_MET;
+
+	::dds_ReturnCode_t ret{};
+	auto next{DynamicDataAccess::Loan(owner, self, [&]() -> ::dds_DynamicData* {
+		::dds_DynamicData* raw{};
+		ret = ::dds_DynamicData_get_complex_value(self, &raw, id);
+		return raw;
+	})};
+	if(ret != dds_RETCODE_OK)
+		return ret;
+	if(!next)
+		return dds_RETCODE_OUT_OF_RESOURCES;
+
+	ret = value.close();
+	if(ret == dds_RETCODE_OK)
+		value = std::move(next);
+	return ret;
+}
+} // namespace detail
+
+inline ::dds_ReturnCode_t dds_DynamicData_get_complex_value(
+    const dds_DynamicData& self, dds_DynamicData& value, ::dds_MemberId_t id) {
+	return detail::GetComplexValue(self.get(), self, value, id);
+}
+
+inline ::dds_ReturnCode_t dds_DynamicData_get_complex_value(
+    ::dds_DynamicData* self, dds_DynamicData& value, ::dds_MemberId_t id) {
+	return detail::GetComplexValue(self, raii::dds_DynamicData_lookup(self), value, id);
+}
+
+using ::dds_DynamicData_get_complex_value;
+
+template <typename TParent>
+inline ::dds_ReturnCode_t dds_DynamicData_get_complex_value(
+    const TParent& self, dds_DynamicData* value, ::dds_MemberId_t id) {
+	if(!value)
+		return dds_RETCODE_BAD_PARAMETER;
+	return raii::dds_DynamicData_get_complex_value(self, *value, id);
+}
+
+inline ::dds_ReturnCode_t dds_DynamicData_return_loaned_value(
+    ::dds_DynamicData* self, dds_DynamicData& value) noexcept {
+	if(!self || !value)
+		return dds_RETCODE_BAD_PARAMETER;
+	if(value.GetDeleter()->m_parent != self)
+		return dds_RETCODE_PRECONDITION_NOT_MET;
+	return value.close();
 }
 
 inline ::dds_ReturnCode_t dds_DynamicData_return_loaned_value(
     const dds_DynamicData& self, dds_DynamicData& value) noexcept {
-	if(!self || !value)
-		return dds_RETCODE_BAD_PARAMETER;
-	if(value.GetDeleter()->parent != self.get())
-		return dds_RETCODE_PRECONDITION_NOT_MET;
-	if(value.GetOwner().use_count() > 2)
-		return dds_RETCODE_PRECONDITION_NOT_MET;
-	const auto ret = ::dds_DynamicData_return_loaned_value(self, value.get());
-	if(ret == dds_RETCODE_OK)
-		(void)value.release();
-	return ret;
+	return raii::dds_DynamicData_return_loaned_value(self.get(), value);
 }
 
 struct dds_Memory_deleter {
@@ -2428,185 +2794,290 @@ inline dds_String dds_strdup(const char* str) {
 	return dds_String::Create([=]() { return ::dds_strdup(str); });
 }
 
+using dds_Wstring = Resource<uint16_t, dds_Memory_deleter>;
+using dds_WideString = Resource<wchar_t, dds_Memory_deleter>;
+
+inline dds_Wstring dds_wcsdup(const uint16_t* value) {
+	return dds_Wstring::Create([value]() { return ::dds_wcsdup(value); });
+}
+
 namespace detail {
 struct SequenceItemAccess {
 	template <typename TSequence, typename TItem, typename TAdd>
 	static bool Add(TSequence& sequence, TItem& value, TAdd add) noexcept {
-		if(!sequence || !value || value.m_state->m_beforeDelete)
+		if(!sequence || !value || !CanTransfer(value))
 			return false;
-
-		const auto ret{value.CloseWith([&sequence, add](typename TItem::native_type* raw) {
-			return add(sequence.get(), raw) ? dds_RETCODE_OK : dds_RETCODE_ERROR;
-		})};
-		return ret == dds_RETCODE_OK;
+		if(!add(sequence.get(), value.get()))
+			return false;
+		Transfer(value);
+		return true;
 	}
 
-	template <typename TItem, typename TSequence, typename TAdd, typename TCopy>
-	static bool AddCopy(TSequence& sequence, const typename TItem::native_type* source, TAdd add, TCopy copy) {
-		if(!sequence || !source)
+	template <typename TSequence, typename TItem, typename TAdd, typename TRemove, typename TLength>
+	static bool AddArray(TSequence& sequence, std::vector<TItem>& values, TAdd add, TRemove remove, TLength length) {
+		if(!sequence)
+			return false;
+		for(const auto& value : values) {
+			if(value && !CanTransfer(value))
+				return false;
+		}
+
+		const uint32_t originalLength{length(sequence.get())};
+		for(const auto& value : values) {
+			if(!add(sequence.get(), value.get())) {
+				while(length(sequence.get()) > originalLength) {
+					(void)remove(sequence.get(), length(sequence.get()) - 1);
+				}
+				return false;
+			}
+		}
+		for(auto& value : values) {
+			if(value)
+				Transfer(value);
+		}
+		return true;
+	}
+
+	template <typename TItem>
+	static TItem Copy(const typename TItem::native_type* source) {
+		using TRaw = typename TItem::native_type;
+		if(!source)
+			return {};
+		auto value{TItem::Create([]() { return static_cast<TRaw*>(::dds_calloc(1, sizeof(TRaw))); })};
+		if(!value || !CopyFields(*source, *value.get()))
+			return {};
+		return value;
+	}
+
+	template <typename TItem, typename TSequence, typename TRawItem, typename TAdd, typename TRemove, typename TLength>
+	static bool AddArrayCopy(
+	    TSequence& sequence, TRawItem* const* values, uint32_t size, TAdd add, TRemove remove, TLength length) {
+		if(!sequence || (!values && size != 0))
 			return false;
 
-		using TRaw = typename TItem::native_type;
-		auto value{TItem::Create([]() { return static_cast<TRaw*>(::dds_calloc(1, sizeof(TRaw))); })};
-		if(!value || !copy(*source, *value.get()))
-			return false;
-		return Add(sequence, value, add);
+		std::vector<TItem> copies;
+		copies.reserve(size);
+		for(uint32_t index{}; index < size; ++index) {
+			auto* raw{static_cast<const typename TItem::native_type*>(values[index])};
+			auto value{Copy<TItem>(raw)};
+			if(values[index] && !value)
+				return false;
+			copies.push_back(std::move(value));
+		}
+		return AddArray(sequence, copies, add, remove, length);
+	}
+
+private:
+	template <typename TItem>
+	static bool CanTransfer(const TItem& value) noexcept {
+		// 이 헬퍼는 sequence가 직접 해제할 수 있는 원소에만 사용합니다.
+		return value.m_state.use_count() == 1 && !value.m_state->m_registry && !value.m_state->m_loan;
+	}
+
+	template <typename TItem>
+	static void Transfer(TItem& value) noexcept {
+		value.ClearRaw();
+		value.reset();
 	}
 
 	static bool CopyField(const char* source, char*& destination) noexcept {
-		destination = source ? ::dds_strdup(source) : nullptr;
-		return !source || destination;
+		if(!source)
+			return true;
+		destination = ::dds_strdup(source);
+		return destination != nullptr;
 	}
 
 	static bool CopyField(::dds_OctetSeq* source, ::dds_OctetSeq*& destination) noexcept {
-		destination = source ? ::dds_OctetSeq_clone(source) : nullptr;
-		return !source || destination;
+		if(!source)
+			return true;
+		destination = ::dds_OctetSeq_clone(source);
+		return destination != nullptr;
+	}
+
+	template <typename TItem>
+	static bool CopyProperty(const TItem& source, TItem& destination) noexcept {
+		destination.propagate = source.propagate;
+		return CopyField(source.name, destination.name) && CopyField(source.value, destination.value);
+	}
+
+	template <typename TItem>
+	static bool CopyKeyed(const TItem& source, TItem& destination) noexcept {
+		return CopyField(source.key, destination.key) && CopyField(source.value, destination.value);
+	}
+
+	static bool CopyFields(const ::dds_Property_t& source, ::dds_Property_t& destination) noexcept {
+		return CopyProperty(source, destination);
+	}
+
+	static bool CopyFields(const ::dds_BinaryProperty_t& source, ::dds_BinaryProperty_t& destination) noexcept {
+		return CopyProperty(source, destination);
+	}
+
+	static bool CopyFields(const ::dds_Tag& source, ::dds_Tag& destination) noexcept {
+		return CopyField(source.name, destination.name) && CopyField(source.value, destination.value);
+	}
+
+	static bool CopyFields(const ::dds_KeyedString& source, ::dds_KeyedString& destination) noexcept {
+		return CopyKeyed(source, destination);
+	}
+
+	static bool CopyFields(const ::dds_Bytes& source, ::dds_Bytes& destination) noexcept {
+		return CopyField(source.value, destination.value);
+	}
+
+	static bool CopyFields(const ::dds_KeyedBytes& source, ::dds_KeyedBytes& destination) noexcept {
+		return CopyKeyed(source, destination);
 	}
 };
+
+template <>
+inline dds_String SequenceItemAccess::Copy<dds_String>(const char* source) {
+	if(!source)
+		return {};
+	return raii::dds_strdup(source);
+}
+
+template <>
+inline dds_Wstring SequenceItemAccess::Copy<dds_Wstring>(const uint16_t* source) {
+	if(!source)
+		return {};
+	return raii::dds_wcsdup(source);
+}
 } // namespace detail
 
-// A pointer or lvalue handle is copied. An rvalue handle transfers ownership on success.
-inline bool dds_StringSeq_add(dds_StringSeq& sequence, dds_String&& value) noexcept {
-	return detail::SequenceItemAccess::Add(sequence, value, ::dds_StringSeq_add);
-}
+// 포인터는 복사하고, rvalue는 삽입이 성공하면 소유권을 넘깁니다.
+#define RAII_SEQUENCE_ITEM_DEFINE(sequence_type, item_type)                                                            \
+	inline bool sequence_type##_add(sequence_type& sequence, item_type&& value) noexcept {                             \
+		return detail::SequenceItemAccess::Add(sequence, value, ::sequence_type##_add);                                \
+	}                                                                                                                  \
+	inline bool sequence_type##_add(sequence_type& sequence, const item_type::native_type* value) {                    \
+		if(!sequence)                                                                                                  \
+			return false;                                                                                              \
+		return raii::sequence_type##_add(sequence, detail::SequenceItemAccess::Copy<item_type>(value));                \
+	}                                                                                                                  \
+	inline bool sequence_type##_add_at(sequence_type& sequence, uint32_t index, item_type&& value) noexcept {          \
+		return detail::SequenceItemAccess::Add(                                                                        \
+		    sequence, value, [index](::sequence_type* dst, item_type::native_type* raw) {                              \
+			    return ::sequence_type##_add_at(dst, index, raw);                                                      \
+		    });                                                                                                        \
+	}                                                                                                                  \
+	inline bool sequence_type##_add_at(sequence_type& sequence, uint32_t index, const item_type::native_type* value) { \
+		if(!sequence)                                                                                                  \
+			return false;                                                                                              \
+		return raii::sequence_type##_add_at(sequence, index, detail::SequenceItemAccess::Copy<item_type>(value));      \
+	}                                                                                                                  \
+	inline bool sequence_type##_add_array(sequence_type& sequence, std::vector<item_type>&& values) {                  \
+		return detail::SequenceItemAccess::AddArray(                                                                   \
+		    sequence, values, ::sequence_type##_add, ::sequence_type##_remove, ::sequence_type##_length);              \
+	}                                                                                                                  \
+	inline bool sequence_type##_add_array(                                                                             \
+	    sequence_type& sequence, const item_type::native_type* const* values, uint32_t size) {                         \
+		return detail::SequenceItemAccess::AddArrayCopy<item_type>(                                                    \
+		    sequence, values, size, ::sequence_type##_add, ::sequence_type##_remove, ::sequence_type##_length);        \
+	}                                                                                                                  \
+	inline item_type sequence_type##_remove(sequence_type& sequence, uint32_t index) {                                 \
+		if(!sequence)                                                                                                  \
+			return {};                                                                                                 \
+		return item_type::Create([&]() { return ::sequence_type##_remove(sequence.get(), index); });                   \
+	}
 
-inline bool dds_StringSeq_add(dds_StringSeq& sequence, const char* value) {
-	if(!sequence || !value)
-		return false;
-	return raii::dds_StringSeq_add(sequence, raii::dds_strdup(value));
-}
+RAII_SEQUENCE_ITEM_DEFINE(dds_StringSeq, dds_String)
+RAII_SEQUENCE_ITEM_DEFINE(dds_WstringSeq, dds_Wstring)
+RAII_SEQUENCE_ITEM_DEFINE(dds_PropertySeq, dds_Property_t)
+RAII_SEQUENCE_ITEM_DEFINE(dds_BinaryPropertySeq, dds_BinaryProperty_t)
+RAII_SEQUENCE_ITEM_DEFINE(dds_TagSeq, dds_Tag)
+RAII_SEQUENCE_ITEM_DEFINE(dds_KeyedStringSeq, dds_KeyedString)
+RAII_SEQUENCE_ITEM_DEFINE(dds_BytesSeq, dds_Bytes)
+RAII_SEQUENCE_ITEM_DEFINE(dds_KeyedBytesSeq, dds_KeyedBytes)
+#undef RAII_SEQUENCE_ITEM_DEFINE
 
-inline bool dds_PropertySeq_add(dds_PropertySeq& sequence, dds_Property_t&& value) noexcept {
-	return detail::SequenceItemAccess::Add(sequence, value, ::dds_PropertySeq_add);
-}
+#define RAII_SEQUENCE_VOID_ITEM_ARRAY_DEFINE(sequence_type, item_type)                                                 \
+	template <typename TItem>                                                                                          \
+	inline typename std::enable_if<std::is_void<TItem>::value, bool>::type sequence_type##_add_array(                  \
+	    sequence_type& sequence, TItem* const* values, uint32_t size) {                                                \
+		return detail::SequenceItemAccess::AddArrayCopy<item_type>(                                                    \
+		    sequence, values, size, ::sequence_type##_add, ::sequence_type##_remove, ::sequence_type##_length);        \
+	}
 
-inline bool dds_PropertySeq_add(dds_PropertySeq& sequence, const ::dds_Property_t* value) {
-	return detail::SequenceItemAccess::AddCopy<dds_Property_t>(
-	    sequence, value, ::dds_PropertySeq_add, [](const ::dds_Property_t& source, ::dds_Property_t& destination) {
-		    destination.propagate = source.propagate;
-		    return detail::SequenceItemAccess::CopyField(source.name, destination.name) &&
-		           detail::SequenceItemAccess::CopyField(source.value, destination.value);
-	    });
-}
-
-inline bool dds_BinaryPropertySeq_add(dds_BinaryPropertySeq& sequence, dds_BinaryProperty_t&& value) noexcept {
-	return detail::SequenceItemAccess::Add(sequence, value, ::dds_BinaryPropertySeq_add);
-}
-
-inline bool dds_BinaryPropertySeq_add(dds_BinaryPropertySeq& sequence, const ::dds_BinaryProperty_t* value) {
-	return detail::SequenceItemAccess::AddCopy<dds_BinaryProperty_t>(sequence,
-	    value,
-	    ::dds_BinaryPropertySeq_add,
-	    [](const ::dds_BinaryProperty_t& source, ::dds_BinaryProperty_t& destination) {
-		    destination.propagate = source.propagate;
-		    return detail::SequenceItemAccess::CopyField(source.name, destination.name) &&
-		           detail::SequenceItemAccess::CopyField(source.value, destination.value);
-	    });
-}
-
-inline bool dds_TagSeq_add(dds_TagSeq& sequence, dds_Tag&& value) noexcept {
-	return detail::SequenceItemAccess::Add(sequence, value, ::dds_TagSeq_add);
-}
-
-inline bool dds_TagSeq_add(dds_TagSeq& sequence, const ::dds_Tag* value) {
-	return detail::SequenceItemAccess::AddCopy<dds_Tag>(
-	    sequence, value, ::dds_TagSeq_add, [](const ::dds_Tag& source, ::dds_Tag& destination) {
-		    return detail::SequenceItemAccess::CopyField(source.name, destination.name) &&
-		           detail::SequenceItemAccess::CopyField(source.value, destination.value);
-	    });
-}
-
-inline bool dds_KeyedStringSeq_add(dds_KeyedStringSeq& sequence, dds_KeyedString&& value) noexcept {
-	return detail::SequenceItemAccess::Add(sequence, value, ::dds_KeyedStringSeq_add);
-}
-
-inline bool dds_KeyedStringSeq_add(dds_KeyedStringSeq& sequence, const ::dds_KeyedString* value) {
-	return detail::SequenceItemAccess::AddCopy<dds_KeyedString>(
-	    sequence, value, ::dds_KeyedStringSeq_add, [](const ::dds_KeyedString& source, ::dds_KeyedString& destination) {
-		    return detail::SequenceItemAccess::CopyField(source.key, destination.key) &&
-		           detail::SequenceItemAccess::CopyField(source.value, destination.value);
-	    });
-}
-
-inline bool dds_BytesSeq_add(dds_BytesSeq& sequence, dds_Bytes&& value) noexcept {
-	return detail::SequenceItemAccess::Add(sequence, value, ::dds_BytesSeq_add);
-}
-
-inline bool dds_BytesSeq_add(dds_BytesSeq& sequence, const ::dds_Bytes* value) {
-	return detail::SequenceItemAccess::AddCopy<dds_Bytes>(
-	    sequence, value, ::dds_BytesSeq_add, [](const ::dds_Bytes& source, ::dds_Bytes& destination) {
-		    return detail::SequenceItemAccess::CopyField(source.value, destination.value);
-	    });
-}
-
-inline bool dds_KeyedBytesSeq_add(dds_KeyedBytesSeq& sequence, dds_KeyedBytes&& value) noexcept {
-	return detail::SequenceItemAccess::Add(sequence, value, ::dds_KeyedBytesSeq_add);
-}
-
-inline bool dds_KeyedBytesSeq_add(dds_KeyedBytesSeq& sequence, const ::dds_KeyedBytes* value) {
-	return detail::SequenceItemAccess::AddCopy<dds_KeyedBytes>(
-	    sequence, value, ::dds_KeyedBytesSeq_add, [](const ::dds_KeyedBytes& source, ::dds_KeyedBytes& destination) {
-		    return detail::SequenceItemAccess::CopyField(source.key, destination.key) &&
-		           detail::SequenceItemAccess::CopyField(source.value, destination.value);
-	    });
-}
+RAII_SEQUENCE_VOID_ITEM_ARRAY_DEFINE(dds_PropertySeq, dds_Property_t)
+RAII_SEQUENCE_VOID_ITEM_ARRAY_DEFINE(dds_BinaryPropertySeq, dds_BinaryProperty_t)
+RAII_SEQUENCE_VOID_ITEM_ARRAY_DEFINE(dds_TagSeq, dds_Tag)
+#undef RAII_SEQUENCE_VOID_ITEM_ARRAY_DEFINE
 
 inline dds_DynamicType dds_DynamicTypeBuilder_build(::dds_DynamicTypeBuilder* self) {
-	return detail::DynamicDataAccess::Register(
-	    dds_DynamicType::Create([self]() { return ::dds_DynamicTypeBuilder_build(self); }));
+	return detail::ResourceAccess::Create<dds_DynamicType>([self]() { return ::dds_DynamicTypeBuilder_build(self); });
+}
+
+inline dds_DynamicType dds_DynamicTypeBuilderFactory_get_primitive_type(
+    ::dds_DynamicTypeBuilderFactory* self, ::dds_TypeKind kind) {
+	return detail::ResourceAccess::Create<dds_DynamicType>(
+	    [=]() { return ::dds_DynamicTypeBuilderFactory_get_primitive_type(self, kind); },
+	    dds_DynamicType_deleter{self});
 }
 
 inline dds_DynamicTypeMember dds_DynamicTypeMember_alloc() {
-	return dds_DynamicTypeMember::Create([&]() { return ::dds_DynamicTypeMember_alloc(); });
+	return dds_DynamicTypeMember::Create([]() { return ::dds_DynamicTypeMember_alloc(); });
 }
 
 inline dds_DynamicTypeSupport dds_DynamicTypeSupport_create_type_support(::dds_DynamicType* type) {
-	return dds_DynamicTypeSupport::Create([&]() { return ::dds_DynamicTypeSupport_create_type_support(type); });
+	return detail::DynamicDataAccess::CreateSupport(
+	    [type]() { return ::dds_DynamicTypeSupport_create_type_support(type); });
 }
 
-// A native type with no registered owner must outlive the data.
+inline dds_DynamicType dds_DynamicTypeSupport_get_dynamictype(const dds_DynamicTypeSupport& self) {
+	if(!self)
+		return {};
+	dds_DynamicType_deleter cleanup;
+	cleanup.m_supportOwner = self.GetOwner();
+	return dds_DynamicType::Create(
+	    [&]() { return ::dds_DynamicTypeSupport_get_dynamictype(self.get()); }, std::move(cleanup));
+}
+
+namespace detail {
+inline dds_DynamicData CreateDynamicData(
+    ::dds_DynamicDataFactory* factory, const ::dds_DynamicType* type, std::shared_ptr<void> typeOwner) {
+	dds_DynamicData_deleter cleanup(factory);
+	cleanup.m_typeOwner = std::move(typeOwner);
+	return ResourceAccess::Create<dds_DynamicData>(
+	    [=]() { return ::dds_DynamicDataFactory_create_data(factory, type); }, std::move(cleanup));
+}
+} // namespace detail
+
+// 등록되지 않은 타입의 수명은 호출자가 관리합니다.
 inline dds_DynamicData dds_DynamicDataFactory_create_data(
     ::dds_DynamicDataFactory* self, const ::dds_DynamicType* type) {
-	auto owner{detail::DynamicDataAccess::Lookup<dds_DynamicType>(type)};
-	dds_DynamicData_deleter cleanup{self};
-	cleanup.type_owner = owner.GetOwner();
-	return detail::DynamicDataAccess::Register(dds_DynamicData::Create(
-	    [self, type]() { return ::dds_DynamicDataFactory_create_data(self, type); }, std::move(cleanup)));
+	return detail::CreateDynamicData(self, type, detail::DynamicDataAccess::GetTypeOwner(type));
 }
 
-// A native source with no registered owner must supply a type that outlives the clone.
-inline dds_DynamicData dds_DynamicData_clone(::dds_DynamicData* self) {
-	auto owner{dds_DynamicData_lookup(self)};
-	return detail::DynamicDataAccess::Clone(self, owner.GetOwner());
-}
-
-// The C DynamicData implementation borrows its type, including in clones.
 inline dds_DynamicData dds_DynamicDataFactory_create_data(::dds_DynamicDataFactory* self, const dds_DynamicType& type) {
-	dds_DynamicData_deleter cleanup(self);
-	cleanup.type_owner = type.GetOwner();
-
-	return detail::DynamicDataAccess::Register(dds_DynamicData::Create(
-	    [&]() { return ::dds_DynamicDataFactory_create_data(self, type); }, std::move(cleanup)));
+	return detail::CreateDynamicData(self, type.get(), detail::DynamicDataAccess::GetTypeOwner(type));
 }
 
 inline dds_DynamicData dds_DynamicData_clone(const dds_DynamicData& self) {
-	return detail::DynamicDataAccess::Clone(self.get(), self.GetOwner());
+	return detail::DynamicDataAccess::Clone(self.get(), detail::DynamicDataAccess::GetTypeOwner(self));
+}
+
+inline dds_DynamicData dds_DynamicData_clone(::dds_DynamicData* self) {
+	auto owner{raii::dds_DynamicData_lookup(self)};
+	return detail::DynamicDataAccess::Clone(self, detail::DynamicDataAccess::GetTypeOwner(owner));
 }
 
 inline dds_TypeSupport dds_TypeSupport_create(const char* metaStr) {
-	return dds_TypeSupport::Create([&]() { return ::dds_TypeSupport_create(metaStr); });
+	return detail::ResourceAccess::Create<dds_TypeSupport>([&]() { return ::dds_TypeSupport_create(metaStr); });
 }
 
 inline dds_TypeSupport dds_TypeSupport_create2(const char** metaStrArray, uint32_t metaStrArrayLen) {
-	return dds_TypeSupport::Create([&]() { return ::dds_TypeSupport_create2(metaStrArray, metaStrArrayLen); });
+	return detail::ResourceAccess::Create<dds_TypeSupport>(
+	    [&]() { return ::dds_TypeSupport_create2(metaStrArray, metaStrArrayLen); });
 }
 
 inline dds_TypeSupport dds_TypeSupport_early_create(const char* metaStr) {
-	return dds_TypeSupport::Create([&]() { return ::dds_TypeSupport_early_create(metaStr); });
+	return detail::ResourceAccess::Create<dds_TypeSupport>([&]() { return ::dds_TypeSupport_early_create(metaStr); });
 }
 
 inline dds_TypeSupport dds_TypeSupport_early_create2(const char** metaStrArray, uint32_t metaStrArrayLen) {
-	return dds_TypeSupport::Create([&]() { return ::dds_TypeSupport_early_create2(metaStrArray, metaStrArrayLen); });
+	return detail::ResourceAccess::Create<dds_TypeSupport>(
+	    [&]() { return ::dds_TypeSupport_early_create2(metaStrArray, metaStrArrayLen); });
 }
 
 inline dds_Memory dds_TypeSupport_serialize(::dds_TypeSupport* self, void* data, size_t* outputSize) {
@@ -2663,15 +3134,16 @@ inline dds_String dds_DomainParticipantFactory_dump_as_string(::dds_DomainPartic
 }
 
 inline dds_TypeSupport dds_TypeSupport_raw_create() {
-	return dds_TypeSupport::Create([&]() { return ::dds_TypeSupport_raw_create(); });
+	return detail::ResourceAccess::Create<dds_TypeSupport>([&]() { return ::dds_TypeSupport_raw_create(); });
 }
 
 inline dds_TypeSupport dds_TypeSupport_raw_create_w_key() {
-	return dds_TypeSupport::Create([&]() { return ::dds_TypeSupport_raw_create_w_key(); });
+	return detail::ResourceAccess::Create<dds_TypeSupport>([&]() { return ::dds_TypeSupport_raw_create_w_key(); });
 }
 
 inline dds_TypeSupport dds_TypeSupport_raw_create_w_typehash(void* typehash, bool hasKey) {
-	return dds_TypeSupport::Create([&]() { return ::dds_TypeSupport_raw_create_w_typehash(typehash, hasKey); });
+	return detail::ResourceAccess::Create<dds_TypeSupport>(
+	    [&]() { return ::dds_TypeSupport_raw_create_w_typehash(typehash, hasKey); });
 }
 
 inline dds_Memory dds_TypeSupport_serialize_be(::dds_TypeSupport* self, void* data, size_t* outputSize) {
@@ -2687,8 +3159,8 @@ inline dds_String dds_TypeSupport_extract_metastring(::dds_TypeSupport* self) {
 }
 
 inline dds_DynamicTypeSupport dds_DynamicTypeSupport_create_type_support_with_metastring(char* metastring) {
-	return dds_DynamicTypeSupport::Create(
-	    [&]() { return ::dds_DynamicTypeSupport_create_type_support_with_metastring(metastring); });
+	return detail::DynamicDataAccess::CreateSupport(
+	    [metastring]() { return ::dds_DynamicTypeSupport_create_type_support_with_metastring(metastring); });
 }
 
 inline dds_String dds_DomainParticipantQos_dump_as_string(::dds_DomainParticipantQos* qos) {
@@ -2716,112 +3188,219 @@ inline dds_String dds_DataReaderQos_dump_as_string(::dds_DataReaderQos* qos) {
 }
 
 struct dds_TypeSupportData_deleter {
-	::dds_TypeSupport* support = nullptr;
-	bool initialized = true;
-	std::shared_ptr<void> support_owner;
+	::dds_TypeSupport* m_support{};
+	bool m_initialized{true};
+	std::shared_ptr<void> m_supportOwner;
+
+	detail::NativeOwnership GetNativeOwnership() const noexcept {
+		return detail::NativeOwnership::Dependent;
+	}
 
 	::dds_ReturnCode_t operator()(void* raw) const noexcept {
-		if(initialized)
-			::dds_TypeSupport_delete_data(support, raw);
+		if(m_initialized)
+			::dds_TypeSupport_delete_data(m_support, raw);
 		else
-			::dds_TypeSupport_free(support, raw);
+			::dds_TypeSupport_free(m_support, raw);
 		return dds_RETCODE_OK;
 	}
 };
 
 using dds_TypeSupportData = Resource<void, dds_TypeSupportData_deleter>;
 
-inline dds_TypeSupportData dds_TypeSupport_create_data(const dds_TypeSupport& self) {
-	dds_TypeSupportData_deleter cleanup;
-	cleanup.support = self.get();
-	cleanup.support_owner = self.GetOwner();
-	cleanup.initialized = true;
-	return dds_TypeSupportData::Create([&]() { return ::dds_TypeSupport_create_data(self); }, cleanup);
-}
-
-inline dds_TypeSupportData dds_TypeSupport_alloc(const dds_TypeSupport& self) {
-	dds_TypeSupportData_deleter cleanup;
-	cleanup.support = self.get();
-	cleanup.support_owner = self.GetOwner();
-	cleanup.initialized = false;
-	return dds_TypeSupportData::Create([&]() { return ::dds_TypeSupport_alloc(self); }, cleanup);
-}
-
-inline dds_TypeSupportData dds_TypeSupport_clone_data(const dds_TypeSupport& self, void* data) {
-	dds_TypeSupportData_deleter cleanup;
-	cleanup.support = self.get();
-	cleanup.support_owner = self.GetOwner();
-	cleanup.initialized = true;
-	return dds_TypeSupportData::Create([&]() { return ::dds_TypeSupport_clone_data(self, data); }, cleanup);
-}
-
-inline dds_TypeSupportData dds_TypeSupport_deserialize(const dds_TypeSupport& self, void* input, size_t inputSize) {
-	dds_TypeSupportData_deleter cleanup;
-	cleanup.support = self.get();
-	cleanup.support_owner = self.GetOwner();
-	cleanup.initialized = true;
-	return dds_TypeSupportData::Create(
-	    [&]() { return ::dds_TypeSupport_deserialize(self, input, inputSize); }, cleanup);
-}
-
-inline void dds_TypeSupport_delete_data(const dds_TypeSupport& self, dds_TypeSupportData& data) {
-	if(!data)
-		return;
-	if(data.GetDeleter()->support != self.get())
-		throw std::invalid_argument("TypeSupport does not own this sample");
-	if(data.GetOwner().use_count() > 2)
-		throw std::logic_error("DDS sample is still in use");
-	::dds_TypeSupport_delete_data(self, data.get());
-	(void)data.release();
-}
-
-inline void dds_TypeSupport_free(const dds_TypeSupport& self, dds_TypeSupportData& data) {
-	if(!data)
-		return;
-	if(data.GetDeleter()->support != self.get())
-		throw std::invalid_argument("TypeSupport does not own this sample");
-	if(data.GetOwner().use_count() > 2)
-		throw std::logic_error("DDS sample is still in use");
-	::dds_TypeSupport_free(self, data.get());
-	(void)data.release();
-}
-
 namespace detail {
-// Shared by the participating sequences, without owning those sequences. The
-// first sequence destruction/reuse returns the entire loan before any C sequence
-// is deleted; later cleanup calls are no-ops. Retains its reader while active.
-struct SequenceLoan {
-	std::shared_ptr<DataReader> reader;
-	::dds_DataSeq* data = nullptr;
-	::dds_DynamicDataSeq* dynamic_data = nullptr;
-	::dds_SampleInfoSeq* infos = nullptr;
-	::dds_UnsignedLongSeq* sizes = nullptr;
-	bool active = false;
+struct TypeSupportDataAccess {
+	template <typename TAllocate>
+	static dds_TypeSupportData Create(
+	    ::dds_TypeSupport* support, std::shared_ptr<void> owner, bool initialized, TAllocate allocate) {
+		if(!support)
+			return {};
+		dds_TypeSupportData_deleter cleanup;
+		cleanup.m_support = support;
+		cleanup.m_supportOwner = std::move(owner);
+		cleanup.m_initialized = initialized;
+		return dds_TypeSupportData::Create(allocate, std::move(cleanup));
+	}
 
-	::dds_ReturnCode_t Finish() noexcept {
-		if(!active)
+	template <typename TCleanup>
+	static void Delete(::dds_TypeSupport* support, dds_TypeSupportData& data, TCleanup cleanup) {
+		if(!data)
+			return;
+		if(!support || data.GetDeleter()->m_support != support)
+			throw std::invalid_argument("TypeSupport does not own this sample");
+		const auto ret{data.CloseWith([&](void* raw) {
+			cleanup(support, raw);
 			return dds_RETCODE_OK;
-		::dds_ReturnCode_t ret;
-		if(sizes)
-			ret = ::dds_DataReader_raw_return_loan(**reader, data, infos, sizes);
-		else if(dynamic_data)
-			ret = ::dds_DynamicDataReader_return_loan(**reader, dynamic_data, infos);
-		else
-			ret = ::dds_DataReader_return_loan(**reader, data, infos);
-		if(ret == dds_RETCODE_OK) {
-			active = false;
-			reader.reset();
-		}
-		return ret;
+		})};
+		if(ret != dds_RETCODE_OK)
+			throw std::logic_error("DDS sample is still in use");
 	}
 };
 } // namespace detail
 
-// Copies samples from an active managed reader loan so the clone can outlive that loan.
+inline dds_TypeSupportData dds_TypeSupport_create_data(const dds_TypeSupport& self) {
+	return detail::TypeSupportDataAccess::Create(
+	    self.get(), self.GetOwner(), true, [&]() { return ::dds_TypeSupport_create_data(self.get()); });
+}
+
+inline dds_TypeSupportData dds_TypeSupport_create_data(::dds_TypeSupport* self) {
+	auto owner{detail::ResourceAccess::Lookup<dds_TypeSupport>(self)};
+	return detail::TypeSupportDataAccess::Create(
+	    self, owner.GetOwner(), true, [=]() { return ::dds_TypeSupport_create_data(self); });
+}
+
+inline dds_TypeSupportData dds_TypeSupport_alloc(const dds_TypeSupport& self) {
+	return detail::TypeSupportDataAccess::Create(
+	    self.get(), self.GetOwner(), false, [&]() { return ::dds_TypeSupport_alloc(self.get()); });
+}
+
+inline dds_TypeSupportData dds_TypeSupport_alloc(::dds_TypeSupport* self) {
+	auto owner{detail::ResourceAccess::Lookup<dds_TypeSupport>(self)};
+	return detail::TypeSupportDataAccess::Create(
+	    self, owner.GetOwner(), false, [=]() { return ::dds_TypeSupport_alloc(self); });
+}
+
+inline dds_TypeSupportData dds_TypeSupport_clone_data(const dds_TypeSupport& self, void* data) {
+	return detail::TypeSupportDataAccess::Create(
+	    self.get(), self.GetOwner(), true, [&]() { return ::dds_TypeSupport_clone_data(self.get(), data); });
+}
+
+inline dds_TypeSupportData dds_TypeSupport_clone_data(::dds_TypeSupport* self, void* data) {
+	auto owner{detail::ResourceAccess::Lookup<dds_TypeSupport>(self)};
+	return detail::TypeSupportDataAccess::Create(
+	    self, owner.GetOwner(), true, [=]() { return ::dds_TypeSupport_clone_data(self, data); });
+}
+
+inline dds_TypeSupportData dds_TypeSupport_deserialize(const dds_TypeSupport& self, void* input, size_t inputSize) {
+	return detail::TypeSupportDataAccess::Create(self.get(), self.GetOwner(), true, [&]() {
+		return ::dds_TypeSupport_deserialize(self.get(), input, inputSize);
+	});
+}
+
+inline dds_TypeSupportData dds_TypeSupport_deserialize(::dds_TypeSupport* self, void* input, size_t inputSize) {
+	auto owner{detail::ResourceAccess::Lookup<dds_TypeSupport>(self)};
+	return detail::TypeSupportDataAccess::Create(
+	    self, owner.GetOwner(), true, [=]() { return ::dds_TypeSupport_deserialize(self, input, inputSize); });
+}
+
+inline void dds_TypeSupport_delete_data(::dds_TypeSupport* self, dds_TypeSupportData& data) {
+	detail::TypeSupportDataAccess::Delete(self, data, ::dds_TypeSupport_delete_data);
+}
+
+inline void dds_TypeSupport_delete_data(const dds_TypeSupport& self, dds_TypeSupportData& data) {
+	raii::dds_TypeSupport_delete_data(self.get(), data);
+}
+
+inline void dds_TypeSupport_free(::dds_TypeSupport* self, dds_TypeSupportData& data) {
+	detail::TypeSupportDataAccess::Delete(self, data, ::dds_TypeSupport_free);
+}
+
+inline void dds_TypeSupport_free(const dds_TypeSupport& self, dds_TypeSupportData& data) {
+	raii::dds_TypeSupport_free(self.get(), data);
+}
+
+namespace detail {
+inline void SetLoanData(SequenceLoan& loan, ::dds_DataSeq* data) noexcept {
+	loan.m_data = data;
+}
+
+inline void SetLoanData(SequenceLoan& loan, ::dds_DynamicDataSeq* data) noexcept {
+	loan.m_dynamicData = data;
+}
+
+inline uint32_t GetLoanOutputLength(::dds_DataSeq* sequence) noexcept {
+	return ::dds_DataSeq_length(sequence);
+}
+
+inline uint32_t GetLoanOutputLength(::dds_DynamicDataSeq* sequence) noexcept {
+	return ::dds_DynamicDataSeq_length(sequence);
+}
+
+template <typename TData, typename TRead>
+::dds_ReturnCode_t ReadSequence(
+    const dds_DataReader& reader, TData& data, dds_SampleInfoSeq& infos, dds_UnsignedLongSeq* sizes, TRead read) {
+	if(!reader || !data || !infos || (sizes && !*sizes))
+		return dds_RETCODE_BAD_PARAMETER;
+
+	auto loan{std::make_shared<SequenceLoan>()};
+	loan->m_reader = SharedImpl(reader);
+	SetLoanData(*loan, data.get());
+	loan->m_infos = infos.get();
+
+	auto ret{SequenceLoanAccess::Prepare(data)};
+	if(ret != dds_RETCODE_OK)
+		return ret;
+	ret = SequenceLoanAccess::Prepare(infos);
+	if(ret != dds_RETCODE_OK)
+		return ret;
+	if(sizes) {
+		ret = SequenceLoanAccess::Prepare(*sizes);
+		if(ret != dds_RETCODE_OK)
+			return ret;
+		loan->m_sizes = sizes->get();
+	}
+
+	ret = SequenceLoanAccess::Finish(data);
+	if(ret != dds_RETCODE_OK)
+		return ret;
+	ret = SequenceLoanAccess::Finish(infos);
+	if(ret != dds_RETCODE_OK)
+		return ret;
+	if(sizes) {
+		ret = SequenceLoanAccess::Finish(*sizes);
+		if(ret != dds_RETCODE_OK)
+			return ret;
+	}
+
+	// 호출자가 채운 원소를 SDK가 반환할 loan에 섞으면 해제 정책을 판별할 수 없습니다.
+	if(GetLoanOutputLength(data.get()) != 0 || ::dds_SampleInfoSeq_length(infos.get()) != 0 ||
+	    (sizes && ::dds_UnsignedLongSeq_length(sizes->get()) != 0))
+		return dds_RETCODE_PRECONDITION_NOT_MET;
+
+	ret = read();
+	if(ret != dds_RETCODE_OK)
+		return ret;
+
+	loan->m_active = true;
+	SequenceLoanAccess::Commit(data, loan);
+	SequenceLoanAccess::Commit(infos, loan);
+	if(sizes)
+		SequenceLoanAccess::Commit(*sizes, loan);
+	return ret;
+}
+
+template <typename TData, typename TReturn>
+::dds_ReturnCode_t ReturnSequence(const dds_DataReader& reader,
+    TData& data,
+    dds_SampleInfoSeq& infos,
+    dds_UnsignedLongSeq* sizes,
+    TReturn returnNative) noexcept {
+	if(!reader || !data || !infos || (sizes && !*sizes))
+		return dds_RETCODE_BAD_PARAMETER;
+
+	auto loan{SequenceLoanAccess::Active(data)};
+	auto infoLoan{SequenceLoanAccess::Active(infos)};
+	std::shared_ptr<SequenceLoan> sizeLoan;
+	if(sizes)
+		sizeLoan = SequenceLoanAccess::Active(*sizes);
+
+	if(loan) {
+		if(loan != infoLoan || **loan->m_reader != reader.get())
+			return dds_RETCODE_PRECONDITION_NOT_MET;
+		if(sizes && loan != sizeLoan)
+			return dds_RETCODE_PRECONDITION_NOT_MET;
+		if(!sizes && loan->m_sizes)
+			return dds_RETCODE_PRECONDITION_NOT_MET;
+		return loan->Finish();
+	}
+
+	if(infoLoan || sizeLoan)
+		return dds_RETCODE_PRECONDITION_NOT_MET;
+	return returnNative();
+}
+} // namespace detail
+
+// 활성 loan에서 복제한 원소는 원본 loan 반환 이후에도 사용할 수 있습니다.
 inline dds_DynamicDataSeq dds_DynamicDataSeq_clone(const dds_DynamicDataSeq& sequence) {
-	const auto* loan{static_cast<const detail::SequenceLoan*>(sequence.GetLoanIdentity())};
-	if(loan && loan->active && loan->dynamic_data == sequence.get())
-		return detail::DynamicDataAccess::CloneSequence(sequence.get(), loan->reader);
 	return raii::dds_DynamicDataSeq_clone(sequence.get());
 }
 
@@ -2832,24 +3411,10 @@ inline ::dds_ReturnCode_t dds_DataReader_read(const dds_DataReader& self,
     ::dds_SampleStateMask sampleStates,
     ::dds_ViewStateMask viewStates,
     ::dds_InstanceStateMask instanceStates) {
-	if(!self || !dataValues || !sampleInfos)
-		return dds_RETCODE_BAD_PARAMETER;
-	auto loan = std::make_shared<detail::SequenceLoan>();
-	loan->reader = detail::SharedImpl(self);
-	loan->data = dataValues;
-	loan->infos = sampleInfos;
-	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->Finish(); };
-	auto ret = dataValues.PrepareLoan(cleanup, loan.get(), self.get());
-	if(ret != dds_RETCODE_OK)
-		return ret;
-	ret = sampleInfos.PrepareLoan(cleanup, loan.get(), self.get());
-	if(ret != dds_RETCODE_OK)
-		return ret;
-	ret = ::dds_DataReader_read(self, dataValues, sampleInfos, maxSamples, sampleStates, viewStates, instanceStates);
-	loan->active = (ret == dds_RETCODE_OK);
-	if(!loan->active)
-		loan->reader.reset();
-	return ret;
+	return detail::ReadSequence(self, dataValues, sampleInfos, nullptr, [&]() {
+		return ::dds_DataReader_read(
+		    self, dataValues, sampleInfos, maxSamples, sampleStates, viewStates, instanceStates);
+	});
 }
 
 inline ::dds_ReturnCode_t dds_DataReader_take(const dds_DataReader& self,
@@ -2859,24 +3424,10 @@ inline ::dds_ReturnCode_t dds_DataReader_take(const dds_DataReader& self,
     ::dds_SampleStateMask sampleStates,
     ::dds_ViewStateMask viewStates,
     ::dds_InstanceStateMask instanceStates) {
-	if(!self || !dataValues || !sampleInfos)
-		return dds_RETCODE_BAD_PARAMETER;
-	auto loan = std::make_shared<detail::SequenceLoan>();
-	loan->reader = detail::SharedImpl(self);
-	loan->data = dataValues;
-	loan->infos = sampleInfos;
-	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->Finish(); };
-	auto ret = dataValues.PrepareLoan(cleanup, loan.get(), self.get());
-	if(ret != dds_RETCODE_OK)
-		return ret;
-	ret = sampleInfos.PrepareLoan(cleanup, loan.get(), self.get());
-	if(ret != dds_RETCODE_OK)
-		return ret;
-	ret = ::dds_DataReader_take(self, dataValues, sampleInfos, maxSamples, sampleStates, viewStates, instanceStates);
-	loan->active = (ret == dds_RETCODE_OK);
-	if(!loan->active)
-		loan->reader.reset();
-	return ret;
+	return detail::ReadSequence(self, dataValues, sampleInfos, nullptr, [&]() {
+		return ::dds_DataReader_take(
+		    self, dataValues, sampleInfos, maxSamples, sampleStates, viewStates, instanceStates);
+	});
 }
 
 inline ::dds_ReturnCode_t dds_DataReader_read_w_condition(const dds_DataReader& self,
@@ -2884,24 +3435,9 @@ inline ::dds_ReturnCode_t dds_DataReader_read_w_condition(const dds_DataReader& 
     dds_SampleInfoSeq& sampleInfos,
     int32_t maxSamples,
     const ::dds_ReadCondition* aCondition) {
-	if(!self || !dataValues || !sampleInfos)
-		return dds_RETCODE_BAD_PARAMETER;
-	auto loan = std::make_shared<detail::SequenceLoan>();
-	loan->reader = detail::SharedImpl(self);
-	loan->data = dataValues;
-	loan->infos = sampleInfos;
-	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->Finish(); };
-	auto ret = dataValues.PrepareLoan(cleanup, loan.get(), self.get());
-	if(ret != dds_RETCODE_OK)
-		return ret;
-	ret = sampleInfos.PrepareLoan(cleanup, loan.get(), self.get());
-	if(ret != dds_RETCODE_OK)
-		return ret;
-	ret = ::dds_DataReader_read_w_condition(self, dataValues, sampleInfos, maxSamples, aCondition);
-	loan->active = (ret == dds_RETCODE_OK);
-	if(!loan->active)
-		loan->reader.reset();
-	return ret;
+	return detail::ReadSequence(self, dataValues, sampleInfos, nullptr, [&]() {
+		return ::dds_DataReader_read_w_condition(self, dataValues, sampleInfos, maxSamples, aCondition);
+	});
 }
 
 inline ::dds_ReturnCode_t dds_DataReader_take_w_condition(const dds_DataReader& self,
@@ -2909,24 +3445,9 @@ inline ::dds_ReturnCode_t dds_DataReader_take_w_condition(const dds_DataReader& 
     dds_SampleInfoSeq& sampleInfos,
     int32_t maxSamples,
     const ::dds_ReadCondition* aCondition) {
-	if(!self || !dataValues || !sampleInfos)
-		return dds_RETCODE_BAD_PARAMETER;
-	auto loan = std::make_shared<detail::SequenceLoan>();
-	loan->reader = detail::SharedImpl(self);
-	loan->data = dataValues;
-	loan->infos = sampleInfos;
-	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->Finish(); };
-	auto ret = dataValues.PrepareLoan(cleanup, loan.get(), self.get());
-	if(ret != dds_RETCODE_OK)
-		return ret;
-	ret = sampleInfos.PrepareLoan(cleanup, loan.get(), self.get());
-	if(ret != dds_RETCODE_OK)
-		return ret;
-	ret = ::dds_DataReader_take_w_condition(self, dataValues, sampleInfos, maxSamples, aCondition);
-	loan->active = (ret == dds_RETCODE_OK);
-	if(!loan->active)
-		loan->reader.reset();
-	return ret;
+	return detail::ReadSequence(self, dataValues, sampleInfos, nullptr, [&]() {
+		return ::dds_DataReader_take_w_condition(self, dataValues, sampleInfos, maxSamples, aCondition);
+	});
 }
 
 inline ::dds_ReturnCode_t dds_DataReader_read_instance(const dds_DataReader& self,
@@ -2937,25 +3458,10 @@ inline ::dds_ReturnCode_t dds_DataReader_read_instance(const dds_DataReader& sel
     ::dds_SampleStateMask sampleStates,
     ::dds_ViewStateMask viewStates,
     ::dds_InstanceStateMask instanceStates) {
-	if(!self || !dataValues || !sampleInfos)
-		return dds_RETCODE_BAD_PARAMETER;
-	auto loan = std::make_shared<detail::SequenceLoan>();
-	loan->reader = detail::SharedImpl(self);
-	loan->data = dataValues;
-	loan->infos = sampleInfos;
-	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->Finish(); };
-	auto ret = dataValues.PrepareLoan(cleanup, loan.get(), self.get());
-	if(ret != dds_RETCODE_OK)
-		return ret;
-	ret = sampleInfos.PrepareLoan(cleanup, loan.get(), self.get());
-	if(ret != dds_RETCODE_OK)
-		return ret;
-	ret = ::dds_DataReader_read_instance(
-	    self, dataValues, sampleInfos, maxSamples, aHandle, sampleStates, viewStates, instanceStates);
-	loan->active = (ret == dds_RETCODE_OK);
-	if(!loan->active)
-		loan->reader.reset();
-	return ret;
+	return detail::ReadSequence(self, dataValues, sampleInfos, nullptr, [&]() {
+		return ::dds_DataReader_read_instance(
+		    self, dataValues, sampleInfos, maxSamples, aHandle, sampleStates, viewStates, instanceStates);
+	});
 }
 
 inline ::dds_ReturnCode_t dds_DataReader_take_instance(const dds_DataReader& self,
@@ -2966,25 +3472,10 @@ inline ::dds_ReturnCode_t dds_DataReader_take_instance(const dds_DataReader& sel
     ::dds_SampleStateMask sampleStates,
     ::dds_ViewStateMask viewStates,
     ::dds_InstanceStateMask instanceStates) {
-	if(!self || !dataValues || !sampleInfos)
-		return dds_RETCODE_BAD_PARAMETER;
-	auto loan = std::make_shared<detail::SequenceLoan>();
-	loan->reader = detail::SharedImpl(self);
-	loan->data = dataValues;
-	loan->infos = sampleInfos;
-	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->Finish(); };
-	auto ret = dataValues.PrepareLoan(cleanup, loan.get(), self.get());
-	if(ret != dds_RETCODE_OK)
-		return ret;
-	ret = sampleInfos.PrepareLoan(cleanup, loan.get(), self.get());
-	if(ret != dds_RETCODE_OK)
-		return ret;
-	ret = ::dds_DataReader_take_instance(
-	    self, dataValues, sampleInfos, maxSamples, aHandle, sampleStates, viewStates, instanceStates);
-	loan->active = (ret == dds_RETCODE_OK);
-	if(!loan->active)
-		loan->reader.reset();
-	return ret;
+	return detail::ReadSequence(self, dataValues, sampleInfos, nullptr, [&]() {
+		return ::dds_DataReader_take_instance(
+		    self, dataValues, sampleInfos, maxSamples, aHandle, sampleStates, viewStates, instanceStates);
+	});
 }
 
 inline ::dds_ReturnCode_t dds_DataReader_read_next_instance(const dds_DataReader& self,
@@ -2995,25 +3486,10 @@ inline ::dds_ReturnCode_t dds_DataReader_read_next_instance(const dds_DataReader
     ::dds_SampleStateMask sampleStates,
     ::dds_ViewStateMask viewStates,
     ::dds_InstanceStateMask instanceStates) {
-	if(!self || !dataValues || !sampleInfos)
-		return dds_RETCODE_BAD_PARAMETER;
-	auto loan = std::make_shared<detail::SequenceLoan>();
-	loan->reader = detail::SharedImpl(self);
-	loan->data = dataValues;
-	loan->infos = sampleInfos;
-	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->Finish(); };
-	auto ret = dataValues.PrepareLoan(cleanup, loan.get(), self.get());
-	if(ret != dds_RETCODE_OK)
-		return ret;
-	ret = sampleInfos.PrepareLoan(cleanup, loan.get(), self.get());
-	if(ret != dds_RETCODE_OK)
-		return ret;
-	ret = ::dds_DataReader_read_next_instance(
-	    self, dataValues, sampleInfos, maxSamples, previousHandle, sampleStates, viewStates, instanceStates);
-	loan->active = (ret == dds_RETCODE_OK);
-	if(!loan->active)
-		loan->reader.reset();
-	return ret;
+	return detail::ReadSequence(self, dataValues, sampleInfos, nullptr, [&]() {
+		return ::dds_DataReader_read_next_instance(
+		    self, dataValues, sampleInfos, maxSamples, previousHandle, sampleStates, viewStates, instanceStates);
+	});
 }
 
 inline ::dds_ReturnCode_t dds_DataReader_take_next_instance(const dds_DataReader& self,
@@ -3024,25 +3500,10 @@ inline ::dds_ReturnCode_t dds_DataReader_take_next_instance(const dds_DataReader
     ::dds_SampleStateMask sampleStates,
     ::dds_ViewStateMask viewStates,
     ::dds_InstanceStateMask instanceStates) {
-	if(!self || !dataValues || !sampleInfos)
-		return dds_RETCODE_BAD_PARAMETER;
-	auto loan = std::make_shared<detail::SequenceLoan>();
-	loan->reader = detail::SharedImpl(self);
-	loan->data = dataValues;
-	loan->infos = sampleInfos;
-	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->Finish(); };
-	auto ret = dataValues.PrepareLoan(cleanup, loan.get(), self.get());
-	if(ret != dds_RETCODE_OK)
-		return ret;
-	ret = sampleInfos.PrepareLoan(cleanup, loan.get(), self.get());
-	if(ret != dds_RETCODE_OK)
-		return ret;
-	ret = ::dds_DataReader_take_next_instance(
-	    self, dataValues, sampleInfos, maxSamples, previousHandle, sampleStates, viewStates, instanceStates);
-	loan->active = (ret == dds_RETCODE_OK);
-	if(!loan->active)
-		loan->reader.reset();
-	return ret;
+	return detail::ReadSequence(self, dataValues, sampleInfos, nullptr, [&]() {
+		return ::dds_DataReader_take_next_instance(
+		    self, dataValues, sampleInfos, maxSamples, previousHandle, sampleStates, viewStates, instanceStates);
+	});
 }
 
 inline ::dds_ReturnCode_t dds_DataReader_read_next_instance_w_condition(const dds_DataReader& self,
@@ -3051,25 +3512,10 @@ inline ::dds_ReturnCode_t dds_DataReader_read_next_instance_w_condition(const dd
     int32_t maxSamples,
     ::dds_InstanceHandle_t previousHandle,
     const ::dds_ReadCondition* aCondition) {
-	if(!self || !dataValues || !sampleInfos)
-		return dds_RETCODE_BAD_PARAMETER;
-	auto loan = std::make_shared<detail::SequenceLoan>();
-	loan->reader = detail::SharedImpl(self);
-	loan->data = dataValues;
-	loan->infos = sampleInfos;
-	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->Finish(); };
-	auto ret = dataValues.PrepareLoan(cleanup, loan.get(), self.get());
-	if(ret != dds_RETCODE_OK)
-		return ret;
-	ret = sampleInfos.PrepareLoan(cleanup, loan.get(), self.get());
-	if(ret != dds_RETCODE_OK)
-		return ret;
-	ret = ::dds_DataReader_read_next_instance_w_condition(
-	    self, dataValues, sampleInfos, maxSamples, previousHandle, aCondition);
-	loan->active = (ret == dds_RETCODE_OK);
-	if(!loan->active)
-		loan->reader.reset();
-	return ret;
+	return detail::ReadSequence(self, dataValues, sampleInfos, nullptr, [&]() {
+		return ::dds_DataReader_read_next_instance_w_condition(
+		    self, dataValues, sampleInfos, maxSamples, previousHandle, aCondition);
+	});
 }
 
 inline ::dds_ReturnCode_t dds_DataReader_take_next_instance_w_condition(const dds_DataReader& self,
@@ -3078,25 +3524,10 @@ inline ::dds_ReturnCode_t dds_DataReader_take_next_instance_w_condition(const dd
     int32_t maxSamples,
     ::dds_InstanceHandle_t previousHandle,
     const ::dds_ReadCondition* aCondition) {
-	if(!self || !dataValues || !sampleInfos)
-		return dds_RETCODE_BAD_PARAMETER;
-	auto loan = std::make_shared<detail::SequenceLoan>();
-	loan->reader = detail::SharedImpl(self);
-	loan->data = dataValues;
-	loan->infos = sampleInfos;
-	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->Finish(); };
-	auto ret = dataValues.PrepareLoan(cleanup, loan.get(), self.get());
-	if(ret != dds_RETCODE_OK)
-		return ret;
-	ret = sampleInfos.PrepareLoan(cleanup, loan.get(), self.get());
-	if(ret != dds_RETCODE_OK)
-		return ret;
-	ret = ::dds_DataReader_take_next_instance_w_condition(
-	    self, dataValues, sampleInfos, maxSamples, previousHandle, aCondition);
-	loan->active = (ret == dds_RETCODE_OK);
-	if(!loan->active)
-		loan->reader.reset();
-	return ret;
+	return detail::ReadSequence(self, dataValues, sampleInfos, nullptr, [&]() {
+		return ::dds_DataReader_take_next_instance_w_condition(
+		    self, dataValues, sampleInfos, maxSamples, previousHandle, aCondition);
+	});
 }
 
 inline ::dds_ReturnCode_t dds_DynamicDataReader_read(const dds_DataReader& self,
@@ -3106,25 +3537,10 @@ inline ::dds_ReturnCode_t dds_DynamicDataReader_read(const dds_DataReader& self,
     ::dds_SampleStateMask sampleStates,
     ::dds_ViewStateMask viewStates,
     ::dds_InstanceStateMask instanceStates) {
-	if(!self || !dataValues || !sampleInfos)
-		return dds_RETCODE_BAD_PARAMETER;
-	auto loan = std::make_shared<detail::SequenceLoan>();
-	loan->reader = detail::SharedImpl(self);
-	loan->dynamic_data = dataValues;
-	loan->infos = sampleInfos;
-	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->Finish(); };
-	auto ret = dataValues.PrepareLoan(cleanup, loan.get(), self.get());
-	if(ret != dds_RETCODE_OK)
-		return ret;
-	ret = sampleInfos.PrepareLoan(cleanup, loan.get(), self.get());
-	if(ret != dds_RETCODE_OK)
-		return ret;
-	ret = ::dds_DynamicDataReader_read(
-	    self, dataValues, sampleInfos, maxSamples, sampleStates, viewStates, instanceStates);
-	loan->active = (ret == dds_RETCODE_OK);
-	if(!loan->active)
-		loan->reader.reset();
-	return ret;
+	return detail::ReadSequence(self, dataValues, sampleInfos, nullptr, [&]() {
+		return ::dds_DynamicDataReader_read(
+		    self, dataValues, sampleInfos, maxSamples, sampleStates, viewStates, instanceStates);
+	});
 }
 
 inline ::dds_ReturnCode_t dds_DynamicDataReader_take(const dds_DataReader& self,
@@ -3134,25 +3550,10 @@ inline ::dds_ReturnCode_t dds_DynamicDataReader_take(const dds_DataReader& self,
     ::dds_SampleStateMask sampleStates,
     ::dds_ViewStateMask viewStates,
     ::dds_InstanceStateMask instanceStates) {
-	if(!self || !dataValues || !sampleInfos)
-		return dds_RETCODE_BAD_PARAMETER;
-	auto loan = std::make_shared<detail::SequenceLoan>();
-	loan->reader = detail::SharedImpl(self);
-	loan->dynamic_data = dataValues;
-	loan->infos = sampleInfos;
-	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->Finish(); };
-	auto ret = dataValues.PrepareLoan(cleanup, loan.get(), self.get());
-	if(ret != dds_RETCODE_OK)
-		return ret;
-	ret = sampleInfos.PrepareLoan(cleanup, loan.get(), self.get());
-	if(ret != dds_RETCODE_OK)
-		return ret;
-	ret = ::dds_DynamicDataReader_take(
-	    self, dataValues, sampleInfos, maxSamples, sampleStates, viewStates, instanceStates);
-	loan->active = (ret == dds_RETCODE_OK);
-	if(!loan->active)
-		loan->reader.reset();
-	return ret;
+	return detail::ReadSequence(self, dataValues, sampleInfos, nullptr, [&]() {
+		return ::dds_DynamicDataReader_take(
+		    self, dataValues, sampleInfos, maxSamples, sampleStates, viewStates, instanceStates);
+	});
 }
 
 inline ::dds_ReturnCode_t dds_DynamicDataReader_read_w_condition(const dds_DataReader& self,
@@ -3160,24 +3561,9 @@ inline ::dds_ReturnCode_t dds_DynamicDataReader_read_w_condition(const dds_DataR
     dds_SampleInfoSeq& sampleInfos,
     int32_t maxSamples,
     const ::dds_ReadCondition* aCondition) {
-	if(!self || !dataValues || !sampleInfos)
-		return dds_RETCODE_BAD_PARAMETER;
-	auto loan = std::make_shared<detail::SequenceLoan>();
-	loan->reader = detail::SharedImpl(self);
-	loan->dynamic_data = dataValues;
-	loan->infos = sampleInfos;
-	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->Finish(); };
-	auto ret = dataValues.PrepareLoan(cleanup, loan.get(), self.get());
-	if(ret != dds_RETCODE_OK)
-		return ret;
-	ret = sampleInfos.PrepareLoan(cleanup, loan.get(), self.get());
-	if(ret != dds_RETCODE_OK)
-		return ret;
-	ret = ::dds_DynamicDataReader_read_w_condition(self, dataValues, sampleInfos, maxSamples, aCondition);
-	loan->active = (ret == dds_RETCODE_OK);
-	if(!loan->active)
-		loan->reader.reset();
-	return ret;
+	return detail::ReadSequence(self, dataValues, sampleInfos, nullptr, [&]() {
+		return ::dds_DynamicDataReader_read_w_condition(self, dataValues, sampleInfos, maxSamples, aCondition);
+	});
 }
 
 inline ::dds_ReturnCode_t dds_DynamicDataReader_take_w_condition(const dds_DataReader& self,
@@ -3185,24 +3571,9 @@ inline ::dds_ReturnCode_t dds_DynamicDataReader_take_w_condition(const dds_DataR
     dds_SampleInfoSeq& sampleInfos,
     int32_t maxSamples,
     const ::dds_ReadCondition* aCondition) {
-	if(!self || !dataValues || !sampleInfos)
-		return dds_RETCODE_BAD_PARAMETER;
-	auto loan = std::make_shared<detail::SequenceLoan>();
-	loan->reader = detail::SharedImpl(self);
-	loan->dynamic_data = dataValues;
-	loan->infos = sampleInfos;
-	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->Finish(); };
-	auto ret = dataValues.PrepareLoan(cleanup, loan.get(), self.get());
-	if(ret != dds_RETCODE_OK)
-		return ret;
-	ret = sampleInfos.PrepareLoan(cleanup, loan.get(), self.get());
-	if(ret != dds_RETCODE_OK)
-		return ret;
-	ret = ::dds_DynamicDataReader_take_w_condition(self, dataValues, sampleInfos, maxSamples, aCondition);
-	loan->active = (ret == dds_RETCODE_OK);
-	if(!loan->active)
-		loan->reader.reset();
-	return ret;
+	return detail::ReadSequence(self, dataValues, sampleInfos, nullptr, [&]() {
+		return ::dds_DynamicDataReader_take_w_condition(self, dataValues, sampleInfos, maxSamples, aCondition);
+	});
 }
 
 inline ::dds_ReturnCode_t dds_DynamicDataReader_read_instance(const dds_DataReader& self,
@@ -3213,25 +3584,10 @@ inline ::dds_ReturnCode_t dds_DynamicDataReader_read_instance(const dds_DataRead
     ::dds_SampleStateMask sampleStates,
     ::dds_ViewStateMask viewStates,
     ::dds_InstanceStateMask instanceStates) {
-	if(!self || !dataValues || !sampleInfos)
-		return dds_RETCODE_BAD_PARAMETER;
-	auto loan = std::make_shared<detail::SequenceLoan>();
-	loan->reader = detail::SharedImpl(self);
-	loan->dynamic_data = dataValues;
-	loan->infos = sampleInfos;
-	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->Finish(); };
-	auto ret = dataValues.PrepareLoan(cleanup, loan.get(), self.get());
-	if(ret != dds_RETCODE_OK)
-		return ret;
-	ret = sampleInfos.PrepareLoan(cleanup, loan.get(), self.get());
-	if(ret != dds_RETCODE_OK)
-		return ret;
-	ret = ::dds_DynamicDataReader_read_instance(
-	    self, dataValues, sampleInfos, maxSamples, aHandle, sampleStates, viewStates, instanceStates);
-	loan->active = (ret == dds_RETCODE_OK);
-	if(!loan->active)
-		loan->reader.reset();
-	return ret;
+	return detail::ReadSequence(self, dataValues, sampleInfos, nullptr, [&]() {
+		return ::dds_DynamicDataReader_read_instance(
+		    self, dataValues, sampleInfos, maxSamples, aHandle, sampleStates, viewStates, instanceStates);
+	});
 }
 
 inline ::dds_ReturnCode_t dds_DynamicDataReader_take_instance(const dds_DataReader& self,
@@ -3242,25 +3598,10 @@ inline ::dds_ReturnCode_t dds_DynamicDataReader_take_instance(const dds_DataRead
     ::dds_SampleStateMask sampleStates,
     ::dds_ViewStateMask viewStates,
     ::dds_InstanceStateMask instanceStates) {
-	if(!self || !dataValues || !sampleInfos)
-		return dds_RETCODE_BAD_PARAMETER;
-	auto loan = std::make_shared<detail::SequenceLoan>();
-	loan->reader = detail::SharedImpl(self);
-	loan->dynamic_data = dataValues;
-	loan->infos = sampleInfos;
-	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->Finish(); };
-	auto ret = dataValues.PrepareLoan(cleanup, loan.get(), self.get());
-	if(ret != dds_RETCODE_OK)
-		return ret;
-	ret = sampleInfos.PrepareLoan(cleanup, loan.get(), self.get());
-	if(ret != dds_RETCODE_OK)
-		return ret;
-	ret = ::dds_DynamicDataReader_take_instance(
-	    self, dataValues, sampleInfos, maxSamples, aHandle, sampleStates, viewStates, instanceStates);
-	loan->active = (ret == dds_RETCODE_OK);
-	if(!loan->active)
-		loan->reader.reset();
-	return ret;
+	return detail::ReadSequence(self, dataValues, sampleInfos, nullptr, [&]() {
+		return ::dds_DynamicDataReader_take_instance(
+		    self, dataValues, sampleInfos, maxSamples, aHandle, sampleStates, viewStates, instanceStates);
+	});
 }
 
 inline ::dds_ReturnCode_t dds_DynamicDataReader_read_next_instance(const dds_DataReader& self,
@@ -3271,25 +3612,10 @@ inline ::dds_ReturnCode_t dds_DynamicDataReader_read_next_instance(const dds_Dat
     ::dds_SampleStateMask sampleStates,
     ::dds_ViewStateMask viewStates,
     ::dds_InstanceStateMask instanceStates) {
-	if(!self || !dataValues || !sampleInfos)
-		return dds_RETCODE_BAD_PARAMETER;
-	auto loan = std::make_shared<detail::SequenceLoan>();
-	loan->reader = detail::SharedImpl(self);
-	loan->dynamic_data = dataValues;
-	loan->infos = sampleInfos;
-	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->Finish(); };
-	auto ret = dataValues.PrepareLoan(cleanup, loan.get(), self.get());
-	if(ret != dds_RETCODE_OK)
-		return ret;
-	ret = sampleInfos.PrepareLoan(cleanup, loan.get(), self.get());
-	if(ret != dds_RETCODE_OK)
-		return ret;
-	ret = ::dds_DynamicDataReader_read_next_instance(
-	    self, dataValues, sampleInfos, maxSamples, previousHandle, sampleStates, viewStates, instanceStates);
-	loan->active = (ret == dds_RETCODE_OK);
-	if(!loan->active)
-		loan->reader.reset();
-	return ret;
+	return detail::ReadSequence(self, dataValues, sampleInfos, nullptr, [&]() {
+		return ::dds_DynamicDataReader_read_next_instance(
+		    self, dataValues, sampleInfos, maxSamples, previousHandle, sampleStates, viewStates, instanceStates);
+	});
 }
 
 inline ::dds_ReturnCode_t dds_DynamicDataReader_take_next_instance(const dds_DataReader& self,
@@ -3300,25 +3626,10 @@ inline ::dds_ReturnCode_t dds_DynamicDataReader_take_next_instance(const dds_Dat
     ::dds_SampleStateMask sampleStates,
     ::dds_ViewStateMask viewStates,
     ::dds_InstanceStateMask instanceStates) {
-	if(!self || !dataValues || !sampleInfos)
-		return dds_RETCODE_BAD_PARAMETER;
-	auto loan = std::make_shared<detail::SequenceLoan>();
-	loan->reader = detail::SharedImpl(self);
-	loan->dynamic_data = dataValues;
-	loan->infos = sampleInfos;
-	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->Finish(); };
-	auto ret = dataValues.PrepareLoan(cleanup, loan.get(), self.get());
-	if(ret != dds_RETCODE_OK)
-		return ret;
-	ret = sampleInfos.PrepareLoan(cleanup, loan.get(), self.get());
-	if(ret != dds_RETCODE_OK)
-		return ret;
-	ret = ::dds_DynamicDataReader_take_next_instance(
-	    self, dataValues, sampleInfos, maxSamples, previousHandle, sampleStates, viewStates, instanceStates);
-	loan->active = (ret == dds_RETCODE_OK);
-	if(!loan->active)
-		loan->reader.reset();
-	return ret;
+	return detail::ReadSequence(self, dataValues, sampleInfos, nullptr, [&]() {
+		return ::dds_DynamicDataReader_take_next_instance(
+		    self, dataValues, sampleInfos, maxSamples, previousHandle, sampleStates, viewStates, instanceStates);
+	});
 }
 
 inline ::dds_ReturnCode_t dds_DynamicDataReader_read_next_instance_w_condition(const dds_DataReader& self,
@@ -3327,25 +3638,10 @@ inline ::dds_ReturnCode_t dds_DynamicDataReader_read_next_instance_w_condition(c
     int32_t maxSamples,
     ::dds_InstanceHandle_t previousHandle,
     const ::dds_ReadCondition* aCondition) {
-	if(!self || !dataValues || !sampleInfos)
-		return dds_RETCODE_BAD_PARAMETER;
-	auto loan = std::make_shared<detail::SequenceLoan>();
-	loan->reader = detail::SharedImpl(self);
-	loan->dynamic_data = dataValues;
-	loan->infos = sampleInfos;
-	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->Finish(); };
-	auto ret = dataValues.PrepareLoan(cleanup, loan.get(), self.get());
-	if(ret != dds_RETCODE_OK)
-		return ret;
-	ret = sampleInfos.PrepareLoan(cleanup, loan.get(), self.get());
-	if(ret != dds_RETCODE_OK)
-		return ret;
-	ret = ::dds_DynamicDataReader_read_next_instance_w_condition(
-	    self, dataValues, sampleInfos, maxSamples, previousHandle, aCondition);
-	loan->active = (ret == dds_RETCODE_OK);
-	if(!loan->active)
-		loan->reader.reset();
-	return ret;
+	return detail::ReadSequence(self, dataValues, sampleInfos, nullptr, [&]() {
+		return ::dds_DynamicDataReader_read_next_instance_w_condition(
+		    self, dataValues, sampleInfos, maxSamples, previousHandle, aCondition);
+	});
 }
 
 inline ::dds_ReturnCode_t dds_DynamicDataReader_take_next_instance_w_condition(const dds_DataReader& self,
@@ -3354,25 +3650,10 @@ inline ::dds_ReturnCode_t dds_DynamicDataReader_take_next_instance_w_condition(c
     int32_t maxSamples,
     ::dds_InstanceHandle_t previousHandle,
     const ::dds_ReadCondition* aCondition) {
-	if(!self || !dataValues || !sampleInfos)
-		return dds_RETCODE_BAD_PARAMETER;
-	auto loan = std::make_shared<detail::SequenceLoan>();
-	loan->reader = detail::SharedImpl(self);
-	loan->dynamic_data = dataValues;
-	loan->infos = sampleInfos;
-	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->Finish(); };
-	auto ret = dataValues.PrepareLoan(cleanup, loan.get(), self.get());
-	if(ret != dds_RETCODE_OK)
-		return ret;
-	ret = sampleInfos.PrepareLoan(cleanup, loan.get(), self.get());
-	if(ret != dds_RETCODE_OK)
-		return ret;
-	ret = ::dds_DynamicDataReader_take_next_instance_w_condition(
-	    self, dataValues, sampleInfos, maxSamples, previousHandle, aCondition);
-	loan->active = (ret == dds_RETCODE_OK);
-	if(!loan->active)
-		loan->reader.reset();
-	return ret;
+	return detail::ReadSequence(self, dataValues, sampleInfos, nullptr, [&]() {
+		return ::dds_DynamicDataReader_take_next_instance_w_condition(
+		    self, dataValues, sampleInfos, maxSamples, previousHandle, aCondition);
+	});
 }
 
 inline ::dds_ReturnCode_t dds_DataReader_read_w_sampleinfoex(const dds_DataReader& self,
@@ -3382,25 +3663,10 @@ inline ::dds_ReturnCode_t dds_DataReader_read_w_sampleinfoex(const dds_DataReade
     ::dds_SampleStateMask sampleStates,
     ::dds_ViewStateMask viewStates,
     ::dds_InstanceStateMask instanceStates) {
-	if(!self || !dataValues || !sampleInfos)
-		return dds_RETCODE_BAD_PARAMETER;
-	auto loan = std::make_shared<detail::SequenceLoan>();
-	loan->reader = detail::SharedImpl(self);
-	loan->data = dataValues;
-	loan->infos = sampleInfos;
-	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->Finish(); };
-	auto ret = dataValues.PrepareLoan(cleanup, loan.get(), self.get());
-	if(ret != dds_RETCODE_OK)
-		return ret;
-	ret = sampleInfos.PrepareLoan(cleanup, loan.get(), self.get());
-	if(ret != dds_RETCODE_OK)
-		return ret;
-	ret = ::dds_DataReader_read_w_sampleinfoex(
-	    self, dataValues, sampleInfos, maxSamples, sampleStates, viewStates, instanceStates);
-	loan->active = (ret == dds_RETCODE_OK);
-	if(!loan->active)
-		loan->reader.reset();
-	return ret;
+	return detail::ReadSequence(self, dataValues, sampleInfos, nullptr, [&]() {
+		return ::dds_DataReader_read_w_sampleinfoex(
+		    self, dataValues, sampleInfos, maxSamples, sampleStates, viewStates, instanceStates);
+	});
 }
 
 inline ::dds_ReturnCode_t dds_DataReader_take_w_sampleinfoex(const dds_DataReader& self,
@@ -3410,25 +3676,10 @@ inline ::dds_ReturnCode_t dds_DataReader_take_w_sampleinfoex(const dds_DataReade
     ::dds_SampleStateMask sampleStates,
     ::dds_ViewStateMask viewStates,
     ::dds_InstanceStateMask instanceStates) {
-	if(!self || !dataValues || !sampleInfos)
-		return dds_RETCODE_BAD_PARAMETER;
-	auto loan = std::make_shared<detail::SequenceLoan>();
-	loan->reader = detail::SharedImpl(self);
-	loan->data = dataValues;
-	loan->infos = sampleInfos;
-	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->Finish(); };
-	auto ret = dataValues.PrepareLoan(cleanup, loan.get(), self.get());
-	if(ret != dds_RETCODE_OK)
-		return ret;
-	ret = sampleInfos.PrepareLoan(cleanup, loan.get(), self.get());
-	if(ret != dds_RETCODE_OK)
-		return ret;
-	ret = ::dds_DataReader_take_w_sampleinfoex(
-	    self, dataValues, sampleInfos, maxSamples, sampleStates, viewStates, instanceStates);
-	loan->active = (ret == dds_RETCODE_OK);
-	if(!loan->active)
-		loan->reader.reset();
-	return ret;
+	return detail::ReadSequence(self, dataValues, sampleInfos, nullptr, [&]() {
+		return ::dds_DataReader_take_w_sampleinfoex(
+		    self, dataValues, sampleInfos, maxSamples, sampleStates, viewStates, instanceStates);
+	});
 }
 
 inline ::dds_ReturnCode_t dds_DataReader_raw_read(const dds_DataReader& self,
@@ -3440,29 +3691,17 @@ inline ::dds_ReturnCode_t dds_DataReader_raw_read(const dds_DataReader& self,
     ::dds_SampleStateMask sampleStates,
     ::dds_ViewStateMask viewStates,
     ::dds_InstanceStateMask instanceStates) {
-	if(!self || !rawDataValues || !sampleInfos || !rawDataSizes)
-		return dds_RETCODE_BAD_PARAMETER;
-	auto loan = std::make_shared<detail::SequenceLoan>();
-	loan->reader = detail::SharedImpl(self);
-	loan->data = rawDataValues;
-	loan->infos = sampleInfos;
-	loan->sizes = rawDataSizes;
-	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->Finish(); };
-	auto ret = rawDataValues.PrepareLoan(cleanup, loan.get(), self.get());
-	if(ret != dds_RETCODE_OK)
-		return ret;
-	ret = sampleInfos.PrepareLoan(cleanup, loan.get(), self.get());
-	if(ret != dds_RETCODE_OK)
-		return ret;
-	ret = rawDataSizes.PrepareLoan(cleanup, loan.get(), self.get());
-	if(ret != dds_RETCODE_OK)
-		return ret;
-	ret = ::dds_DataReader_raw_read(
-	    self, handle, rawDataValues, sampleInfos, rawDataSizes, maxSamples, sampleStates, viewStates, instanceStates);
-	loan->active = (ret == dds_RETCODE_OK);
-	if(!loan->active)
-		loan->reader.reset();
-	return ret;
+	return detail::ReadSequence(self, rawDataValues, sampleInfos, &rawDataSizes, [&]() {
+		return ::dds_DataReader_raw_read(self,
+		    handle,
+		    rawDataValues,
+		    sampleInfos,
+		    rawDataSizes,
+		    maxSamples,
+		    sampleStates,
+		    viewStates,
+		    instanceStates);
+	});
 }
 
 inline ::dds_ReturnCode_t dds_DataReader_raw_read_w_sampleinfoex(const dds_DataReader& self,
@@ -3474,29 +3713,17 @@ inline ::dds_ReturnCode_t dds_DataReader_raw_read_w_sampleinfoex(const dds_DataR
     ::dds_SampleStateMask sampleStates,
     ::dds_ViewStateMask viewStates,
     ::dds_InstanceStateMask instanceStates) {
-	if(!self || !rawDataValues || !sampleInfoexs || !rawDataSizes)
-		return dds_RETCODE_BAD_PARAMETER;
-	auto loan = std::make_shared<detail::SequenceLoan>();
-	loan->reader = detail::SharedImpl(self);
-	loan->data = rawDataValues;
-	loan->infos = sampleInfoexs;
-	loan->sizes = rawDataSizes;
-	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->Finish(); };
-	auto ret = rawDataValues.PrepareLoan(cleanup, loan.get(), self.get());
-	if(ret != dds_RETCODE_OK)
-		return ret;
-	ret = sampleInfoexs.PrepareLoan(cleanup, loan.get(), self.get());
-	if(ret != dds_RETCODE_OK)
-		return ret;
-	ret = rawDataSizes.PrepareLoan(cleanup, loan.get(), self.get());
-	if(ret != dds_RETCODE_OK)
-		return ret;
-	ret = ::dds_DataReader_raw_read_w_sampleinfoex(
-	    self, handle, rawDataValues, sampleInfoexs, rawDataSizes, maxSamples, sampleStates, viewStates, instanceStates);
-	loan->active = (ret == dds_RETCODE_OK);
-	if(!loan->active)
-		loan->reader.reset();
-	return ret;
+	return detail::ReadSequence(self, rawDataValues, sampleInfoexs, &rawDataSizes, [&]() {
+		return ::dds_DataReader_raw_read_w_sampleinfoex(self,
+		    handle,
+		    rawDataValues,
+		    sampleInfoexs,
+		    rawDataSizes,
+		    maxSamples,
+		    sampleStates,
+		    viewStates,
+		    instanceStates);
+	});
 }
 
 inline ::dds_ReturnCode_t dds_DataReader_raw_take(const dds_DataReader& self,
@@ -3508,29 +3735,17 @@ inline ::dds_ReturnCode_t dds_DataReader_raw_take(const dds_DataReader& self,
     ::dds_SampleStateMask sampleStates,
     ::dds_ViewStateMask viewStates,
     ::dds_InstanceStateMask instanceStates) {
-	if(!self || !rawDataValues || !sampleInfos || !rawDataSizes)
-		return dds_RETCODE_BAD_PARAMETER;
-	auto loan = std::make_shared<detail::SequenceLoan>();
-	loan->reader = detail::SharedImpl(self);
-	loan->data = rawDataValues;
-	loan->infos = sampleInfos;
-	loan->sizes = rawDataSizes;
-	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->Finish(); };
-	auto ret = rawDataValues.PrepareLoan(cleanup, loan.get(), self.get());
-	if(ret != dds_RETCODE_OK)
-		return ret;
-	ret = sampleInfos.PrepareLoan(cleanup, loan.get(), self.get());
-	if(ret != dds_RETCODE_OK)
-		return ret;
-	ret = rawDataSizes.PrepareLoan(cleanup, loan.get(), self.get());
-	if(ret != dds_RETCODE_OK)
-		return ret;
-	ret = ::dds_DataReader_raw_take(
-	    self, handle, rawDataValues, sampleInfos, rawDataSizes, maxSamples, sampleStates, viewStates, instanceStates);
-	loan->active = (ret == dds_RETCODE_OK);
-	if(!loan->active)
-		loan->reader.reset();
-	return ret;
+	return detail::ReadSequence(self, rawDataValues, sampleInfos, &rawDataSizes, [&]() {
+		return ::dds_DataReader_raw_take(self,
+		    handle,
+		    rawDataValues,
+		    sampleInfos,
+		    rawDataSizes,
+		    maxSamples,
+		    sampleStates,
+		    viewStates,
+		    instanceStates);
+	});
 }
 
 inline ::dds_ReturnCode_t dds_DataReader_raw_take_w_sampleinfoex(const dds_DataReader& self,
@@ -3542,114 +3757,70 @@ inline ::dds_ReturnCode_t dds_DataReader_raw_take_w_sampleinfoex(const dds_DataR
     ::dds_SampleStateMask sampleStates,
     ::dds_ViewStateMask viewStates,
     ::dds_InstanceStateMask instanceStates) {
-	if(!self || !rawDataValues || !sampleInfoexs || !rawDataSizes)
-		return dds_RETCODE_BAD_PARAMETER;
-	auto loan = std::make_shared<detail::SequenceLoan>();
-	loan->reader = detail::SharedImpl(self);
-	loan->data = rawDataValues;
-	loan->infos = sampleInfoexs;
-	loan->sizes = rawDataSizes;
-	std::function<::dds_ReturnCode_t()> cleanup = [loan]() { return loan->Finish(); };
-	auto ret = rawDataValues.PrepareLoan(cleanup, loan.get(), self.get());
-	if(ret != dds_RETCODE_OK)
-		return ret;
-	ret = sampleInfoexs.PrepareLoan(cleanup, loan.get(), self.get());
-	if(ret != dds_RETCODE_OK)
-		return ret;
-	ret = rawDataSizes.PrepareLoan(cleanup, loan.get(), self.get());
-	if(ret != dds_RETCODE_OK)
-		return ret;
-	ret = ::dds_DataReader_raw_take_w_sampleinfoex(
-	    self, handle, rawDataValues, sampleInfoexs, rawDataSizes, maxSamples, sampleStates, viewStates, instanceStates);
-	loan->active = (ret == dds_RETCODE_OK);
-	if(!loan->active)
-		loan->reader.reset();
-	return ret;
+	return detail::ReadSequence(self, rawDataValues, sampleInfoexs, &rawDataSizes, [&]() {
+		return ::dds_DataReader_raw_take_w_sampleinfoex(self,
+		    handle,
+		    rawDataValues,
+		    sampleInfoexs,
+		    rawDataSizes,
+		    maxSamples,
+		    sampleStates,
+		    viewStates,
+		    instanceStates);
+	});
 }
 
 inline ::dds_ReturnCode_t dds_DataReader_return_loan(
     const dds_DataReader& self, dds_DataSeq& data, dds_SampleInfoSeq& infos) noexcept {
-	if(!self || !data || !infos)
-		return dds_RETCODE_BAD_PARAMETER;
-	if(data.GetLoanIdentity()) {
-		if(data.GetLoanIdentity() != infos.GetLoanIdentity() || data.GetLoanReader() != self.get())
-			return dds_RETCODE_PRECONDITION_NOT_MET;
-		auto ret = data.FinishLoan();
-		if(ret != dds_RETCODE_OK)
-			return ret;
-		(void)infos.FinishLoan();
-
-		return ret;
-	}
-	if(infos.GetLoanIdentity())
-		return dds_RETCODE_PRECONDITION_NOT_MET;
-	return ::dds_DataReader_return_loan(self, data, infos);
+	return detail::ReturnSequence(
+	    self, data, infos, nullptr, [&]() { return ::dds_DataReader_return_loan(self, data, infos); });
 }
 
 inline ::dds_ReturnCode_t dds_DataReader_raw_return_loan(
     const dds_DataReader& self, dds_DataSeq& data, dds_SampleInfoSeq& infos, dds_UnsignedLongSeq& sizes) noexcept {
-	if(!self || !data || !infos || !sizes)
-		return dds_RETCODE_BAD_PARAMETER;
-	if(data.GetLoanIdentity()) {
-		if(data.GetLoanIdentity() != infos.GetLoanIdentity() || data.GetLoanReader() != self.get() ||
-		    data.GetLoanIdentity() != sizes.GetLoanIdentity())
-			return dds_RETCODE_PRECONDITION_NOT_MET;
-		auto ret = data.FinishLoan();
-		if(ret != dds_RETCODE_OK)
-			return ret;
-		(void)infos.FinishLoan();
-		(void)sizes.FinishLoan();
-		return ret;
-	}
-	if(infos.GetLoanIdentity() || sizes.GetLoanIdentity())
-		return dds_RETCODE_PRECONDITION_NOT_MET;
-	return ::dds_DataReader_raw_return_loan(self, data, infos, sizes);
+	return detail::ReturnSequence(
+	    self, data, infos, &sizes, [&]() { return ::dds_DataReader_raw_return_loan(self, data, infos, sizes); });
 }
 
 inline ::dds_ReturnCode_t dds_DynamicDataReader_return_loan(
     const dds_DataReader& self, dds_DynamicDataSeq& data, dds_SampleInfoSeq& infos) noexcept {
-	if(!self || !data || !infos)
-		return dds_RETCODE_BAD_PARAMETER;
-	if(data.GetLoanIdentity()) {
-		if(data.GetLoanIdentity() != infos.GetLoanIdentity() || data.GetLoanReader() != self.get())
+	return detail::ReturnSequence(self, data, infos, nullptr, [&]() {
+		if(data.GetDeleter()->m_itemsOwner)
 			return dds_RETCODE_PRECONDITION_NOT_MET;
-		auto ret = data.FinishLoan();
-		if(ret != dds_RETCODE_OK)
-			return ret;
-		(void)infos.FinishLoan();
-
-		return ret;
-	}
-	if(infos.GetLoanIdentity() || data.GetDeleter()->m_itemsOwner)
-		return dds_RETCODE_PRECONDITION_NOT_MET;
-	return ::dds_DynamicDataReader_return_loan(self, data, infos);
+		return ::dds_DynamicDataReader_return_loan(self, data, infos);
+	});
 }
 
 struct dds_ReaderLoan_deleter {
-	std::shared_ptr<DataReader> reader;
+	::dds_DataReader* m_reader{};
+	std::shared_ptr<DataReader> m_owner;
+
+	detail::NativeOwnership GetNativeOwnership() const noexcept {
+		return detail::NativeOwnership::Dependent;
+	}
 
 	::dds_ReturnCode_t operator()(void* raw) const noexcept {
-		return ::dds_DataReader_return_loaned_sample(**reader, raw);
+		if(!m_reader)
+			return dds_RETCODE_BAD_PARAMETER;
+		return ::dds_DataReader_return_loaned_sample(m_reader, raw);
 	}
 };
 
 using dds_ReaderLoan = Resource<void, dds_ReaderLoan_deleter>;
 
-inline ::dds_ReturnCode_t dds_DataReader_return_loaned_sample(
-    const dds_DataReader& self, dds_ReaderLoan& sample) noexcept {
-	if(!self || !sample)
-		return dds_RETCODE_BAD_PARAMETER;
-	if(sample.GetDeleter()->reader != detail::SharedImpl(self))
-		return dds_RETCODE_PRECONDITION_NOT_MET;
-	return sample.close();
-}
-
 struct dds_WriterLoan_deleter {
-	std::shared_ptr<DataWriter> writer;
+	::dds_DataWriter* m_writer{};
+	std::shared_ptr<DataWriter> m_owner;
 	size_t m_capacity{};
 
+	detail::NativeOwnership GetNativeOwnership() const noexcept {
+		return detail::NativeOwnership::Dependent;
+	}
+
 	::dds_ReturnCode_t operator()(void* raw) const noexcept {
-		::dds_DataWriter_return_loaned_sample(**writer, raw);
+		if(!m_writer)
+			return dds_RETCODE_BAD_PARAMETER;
+		::dds_DataWriter_return_loaned_sample(m_writer, raw);
 		return dds_RETCODE_OK;
 	}
 };
@@ -3657,118 +3828,228 @@ struct dds_WriterLoan_deleter {
 using dds_WriterLoan = Resource<void, dds_WriterLoan_deleter>;
 
 namespace detail {
+template <typename TEntity>
+typename TEntity::DDSType* GetLoanEndpoint(typename TEntity::DDSType* raw) noexcept {
+	return raw;
+}
+
+template <typename TEntity>
+typename TEntity::DDSType* GetLoanEndpoint(const DDSEntity<TEntity>& entity) noexcept {
+	return entity.get();
+}
+
+template <typename TEntity>
+std::shared_ptr<TEntity> GetLoanEndpointOwner(typename TEntity::DDSType* raw) {
+	return RegisteredOwner<TEntity>(raw);
+}
+
+template <typename TEntity>
+std::shared_ptr<TEntity> GetLoanEndpointOwner(const DDSEntity<TEntity>& entity) noexcept {
+	return SharedImpl(entity);
+}
+
+template <typename TLoan, typename TDeleter, typename TAcquire>
+::dds_ReturnCode_t AcquireSampleLoan(TLoan& sample, TDeleter cleanup, TAcquire acquire) {
+	auto ret{sample.close()};
+	if(ret != dds_RETCODE_OK)
+		return ret;
+
+	auto next{TLoan::Create(
+	    [&]() -> void* {
+		    void* raw{};
+		    ret = acquire(&raw);
+		    return raw;
+	    },
+	    std::move(cleanup))};
+	if(ret == dds_RETCODE_OK)
+		sample = std::move(next);
+	return ret;
+}
+
+template <typename TReader, typename TRead>
+::dds_ReturnCode_t ReadSampleLoan(const TReader& self, dds_ReaderLoan& sample, ::dds_SampleInfoEx* info, TRead read) {
+	auto* reader{GetLoanEndpoint<DataReader>(self)};
+	if(!reader || !info)
+		return dds_RETCODE_BAD_PARAMETER;
+	dds_ReaderLoan_deleter cleanup;
+	cleanup.m_reader = reader;
+	cleanup.m_owner = GetLoanEndpointOwner<DataReader>(self);
+	if(!cleanup.m_owner && sample && sample.GetDeleter()->m_reader == reader)
+		cleanup.m_owner = sample.GetDeleter()->m_owner;
+	return AcquireSampleLoan(sample, std::move(cleanup), [=](void** raw) { return read(reader, raw, info); });
+}
+
 struct WriterLoanAccess {
 	static void SetCapacity(dds_WriterLoan& sample, size_t capacity) noexcept {
 		sample.m_state->m_deleter.m_capacity = capacity;
 	}
 
-	template <typename TWrite>
-	static ::dds_ReturnCode_t Write(const dds_DataWriter& writer, dds_WriterLoan& sample, uint32_t size, TWrite write) {
+	template <typename TWriter, typename TWrite>
+	static ::dds_ReturnCode_t Write(const TWriter& self, dds_WriterLoan& sample, uint32_t size, TWrite write) {
 		constexpr uint32_t CDR_HEADER_SIZE{4};
+		auto* writer{GetLoanEndpoint<DataWriter>(self)};
 		if(!writer || !sample || size < CDR_HEADER_SIZE || size > sample.GetDeleter()->m_capacity)
 			return dds_RETCODE_BAD_PARAMETER;
-		if(sample.GetDeleter()->writer != SharedImpl(writer) || sample.GetOwner().use_count() > 2)
+		const auto* cleanup{sample.GetDeleter()};
+		if(cleanup->m_writer != writer || sample.m_state.use_count() != 1)
 			return dds_RETCODE_PRECONDITION_NOT_MET;
 
-		// Native raw writes can fail before or after taking a shared-memory loan.
-		// Return the original loan first and give the SDK an independent buffer.
-		std::vector<uint8_t> payload(size);
-		std::memcpy(payload.data(), sample.get(), size);
+		// SDK는 오류 시점에 따라 loan을 이미 소비할 수 있습니다.
+		// 원본을 먼저 반환하고 독립 버퍼로 쓰는 동안 Writer는 내부에서 유지합니다.
+		auto writerOwner{cleanup->m_owner};
+		std::unique_ptr<void, decltype(&::dds_free)> payload{::dds_malloc(size), ::dds_free};
+		if(!payload)
+			return dds_RETCODE_OUT_OF_RESOURCES;
+		std::memcpy(payload.get(), sample.get(), size);
 		const auto ret{sample.close()};
 		if(ret != dds_RETCODE_OK)
 			return ret;
-		return write(payload.data());
+		return write(writer, payload.get());
 	}
 };
 } // namespace detail
 
-inline void dds_DataWriter_return_loaned_sample(const dds_DataWriter& self, dds_WriterLoan& sample) {
-	if(sample && sample.GetDeleter()->writer != detail::SharedImpl(self))
-		throw std::invalid_argument("DataWriter does not own this loan");
-	sample.reset();
+using ::dds_DataReader_read_next_loaned_sample;
+using ::dds_DataReader_return_loaned_sample;
+using ::dds_DataReader_take_next_loaned_sample;
+using ::dds_DataWriter_get_loan;
+using ::dds_DataWriter_raw_write;
+using ::dds_DataWriter_raw_write_w_sampleinfoex;
+using ::dds_DataWriter_raw_write_w_timestamp;
+using ::dds_DataWriter_return_loaned_sample;
+
+template <typename TReader>
+inline ::dds_ReturnCode_t dds_DataReader_return_loaned_sample(const TReader& self, dds_ReaderLoan& sample) noexcept {
+	auto* reader{detail::GetLoanEndpoint<DataReader>(self)};
+	if(!reader || !sample)
+		return dds_RETCODE_BAD_PARAMETER;
+	if(sample.GetDeleter()->m_reader != reader)
+		return dds_RETCODE_PRECONDITION_NOT_MET;
+	return sample.close();
 }
 
-inline ::dds_ReturnCode_t dds_DataWriter_get_loan(const dds_DataWriter& self, dds_WriterLoan& sample, size_t* size) {
-	if(!self || !size)
+template <typename TReader>
+::dds_ReturnCode_t dds_DataReader_return_loaned_sample(const TReader&, const dds_ReaderLoan&) = delete;
+
+template <typename TWriter>
+inline void dds_DataWriter_return_loaned_sample(const TWriter& self, dds_WriterLoan& sample) {
+	if(!sample)
+		return;
+	if(sample.GetDeleter()->m_writer != detail::GetLoanEndpoint<DataWriter>(self))
+		throw std::invalid_argument("DataWriter does not own this loan");
+	if(sample.close() != dds_RETCODE_OK)
+		throw std::logic_error("DDS writer loan is still in use");
+}
+
+template <typename TWriter>
+void dds_DataWriter_return_loaned_sample(const TWriter&, const dds_WriterLoan&) = delete;
+
+template <typename TWriter>
+inline ::dds_ReturnCode_t dds_DataWriter_get_loan(const TWriter& self, dds_WriterLoan& sample, size_t* size) {
+	auto* writer{detail::GetLoanEndpoint<DataWriter>(self)};
+	if(!writer || !size)
 		return dds_RETCODE_BAD_PARAMETER;
-	auto ret = sample.close();
-	if(ret != dds_RETCODE_OK)
-		return ret;
 	dds_WriterLoan_deleter cleanup;
-	cleanup.writer = detail::SharedImpl(self);
-	sample = dds_WriterLoan::Create(
-	    [&]() {
-		    void* raw = nullptr;
-		    ret = ::dds_DataWriter_get_loan(self, &raw, size);
-		    return ret == dds_RETCODE_OK ? raw : nullptr;
-	    },
-	    cleanup);
-	if(sample)
+	cleanup.m_writer = writer;
+	cleanup.m_owner = detail::GetLoanEndpointOwner<DataWriter>(self);
+	if(!cleanup.m_owner && sample && sample.GetDeleter()->m_writer == writer)
+		cleanup.m_owner = sample.GetDeleter()->m_owner;
+	const auto ret{detail::AcquireSampleLoan(
+	    sample, std::move(cleanup), [=](void** raw) { return ::dds_DataWriter_get_loan(writer, raw, size); })};
+	if(sample && ret == dds_RETCODE_OK)
 		detail::WriterLoanAccess::SetCapacity(sample, *size);
 	return ret;
 }
 
-// Consumes the loan before the native write. A native write failure does not restore it.
-inline ::dds_ReturnCode_t dds_DataWriter_raw_write(
-    const dds_DataWriter& self, dds_WriterLoan&& sample, uint32_t size) {
-	return detail::WriterLoanAccess::Write(
-	    self, sample, size, [&](const void* raw) { return ::dds_DataWriter_raw_write(self, raw, size); });
+template <typename TWriter>
+inline ::dds_ReturnCode_t dds_DataWriter_get_loan(const TWriter& self, dds_WriterLoan* sample, size_t* size) {
+	if(!sample)
+		return dds_RETCODE_BAD_PARAMETER;
+	return raii::dds_DataWriter_get_loan(self, *sample, size);
 }
 
+// 원본 loan은 native 쓰기 전에 반환되므로 이후 쓰기가 실패해도 반환된 상태입니다.
+template <typename TWriter>
+inline ::dds_ReturnCode_t dds_DataWriter_raw_write(const TWriter& self, dds_WriterLoan& sample, uint32_t size) {
+	return detail::WriterLoanAccess::Write(self, sample, size, [size](::dds_DataWriter* writer, const void* raw) {
+		return ::dds_DataWriter_raw_write(writer, raw, size);
+	});
+}
+
+template <typename TWriter>
+inline ::dds_ReturnCode_t dds_DataWriter_raw_write(const TWriter& self, dds_WriterLoan&& sample, uint32_t size) {
+	return raii::dds_DataWriter_raw_write(self, sample, size);
+}
+
+template <typename TWriter>
+::dds_ReturnCode_t dds_DataWriter_raw_write(const TWriter&, const dds_WriterLoan&, uint32_t) = delete;
+
+template <typename TWriter>
 inline ::dds_ReturnCode_t dds_DataWriter_raw_write_w_timestamp(
-    const dds_DataWriter& self, dds_WriterLoan&& sample, uint32_t size, const ::dds_Time_t* timestamp) {
+    const TWriter& self, dds_WriterLoan& sample, uint32_t size, const ::dds_Time_t* timestamp) {
 	if(!timestamp)
 		return dds_RETCODE_BAD_PARAMETER;
-	return detail::WriterLoanAccess::Write(self, sample, size, [&](const void* raw) {
-		return ::dds_DataWriter_raw_write_w_timestamp(self, raw, size, timestamp);
+	return detail::WriterLoanAccess::Write(self, sample, size, [=](::dds_DataWriter* writer, const void* raw) {
+		return ::dds_DataWriter_raw_write_w_timestamp(writer, raw, size, timestamp);
 	});
 }
 
+template <typename TWriter>
+inline ::dds_ReturnCode_t dds_DataWriter_raw_write_w_timestamp(
+    const TWriter& self, dds_WriterLoan&& sample, uint32_t size, const ::dds_Time_t* timestamp) {
+	return raii::dds_DataWriter_raw_write_w_timestamp(self, sample, size, timestamp);
+}
+
+template <typename TWriter>
+::dds_ReturnCode_t dds_DataWriter_raw_write_w_timestamp(
+    const TWriter&, const dds_WriterLoan&, uint32_t, const ::dds_Time_t*) = delete;
+
+template <typename TWriter>
 inline ::dds_ReturnCode_t dds_DataWriter_raw_write_w_sampleinfoex(
-    const dds_DataWriter& self, dds_WriterLoan&& sample, uint32_t size, ::dds_SampleInfoEx* info) {
+    const TWriter& self, dds_WriterLoan& sample, uint32_t size, ::dds_SampleInfoEx* info) {
 	if(!info)
 		return dds_RETCODE_BAD_PARAMETER;
-	return detail::WriterLoanAccess::Write(self, sample, size, [&](const void* raw) {
-		return ::dds_DataWriter_raw_write_w_sampleinfoex(self, raw, size, info);
+	return detail::WriterLoanAccess::Write(self, sample, size, [=](::dds_DataWriter* writer, const void* raw) {
+		return ::dds_DataWriter_raw_write_w_sampleinfoex(writer, raw, size, info);
 	});
 }
 
-inline ::dds_ReturnCode_t dds_DataReader_read_next_loaned_sample(
-    const dds_DataReader& self, dds_ReaderLoan& sample, ::dds_SampleInfoEx* info) {
-	if(!self || !info)
-		return dds_RETCODE_BAD_PARAMETER;
-	auto ret = sample.close();
-	if(ret != dds_RETCODE_OK)
-		return ret;
-	dds_ReaderLoan_deleter cleanup;
-	cleanup.reader = detail::SharedImpl(self);
-	sample = dds_ReaderLoan::Create(
-	    [&]() {
-		    void* raw = nullptr;
-		    ret = ::dds_DataReader_read_next_loaned_sample(self, &raw, info);
-		    return ret == dds_RETCODE_OK ? raw : nullptr;
-	    },
-	    cleanup);
-	return ret;
+template <typename TWriter>
+inline ::dds_ReturnCode_t dds_DataWriter_raw_write_w_sampleinfoex(
+    const TWriter& self, dds_WriterLoan&& sample, uint32_t size, ::dds_SampleInfoEx* info) {
+	return raii::dds_DataWriter_raw_write_w_sampleinfoex(self, sample, size, info);
 }
 
-inline ::dds_ReturnCode_t dds_DataReader_take_next_loaned_sample(
-    const dds_DataReader& self, dds_ReaderLoan& sample, ::dds_SampleInfoEx* info) {
-	if(!self || !info)
+template <typename TWriter>
+::dds_ReturnCode_t dds_DataWriter_raw_write_w_sampleinfoex(
+    const TWriter&, const dds_WriterLoan&, uint32_t, ::dds_SampleInfoEx*) = delete;
+
+template <typename TReader>
+inline ::dds_ReturnCode_t dds_DataReader_read_next_loaned_sample(
+    const TReader& self, dds_ReaderLoan& sample, ::dds_SampleInfoEx* info) {
+	return detail::ReadSampleLoan(self, sample, info, ::dds_DataReader_read_next_loaned_sample);
+}
+
+template <typename TReader>
+inline ::dds_ReturnCode_t dds_DataReader_read_next_loaned_sample(
+    const TReader& self, dds_ReaderLoan* sample, ::dds_SampleInfoEx* info) {
+	if(!sample)
 		return dds_RETCODE_BAD_PARAMETER;
-	auto ret = sample.close();
-	if(ret != dds_RETCODE_OK)
-		return ret;
-	dds_ReaderLoan_deleter cleanup;
-	cleanup.reader = detail::SharedImpl(self);
-	sample = dds_ReaderLoan::Create(
-	    [&]() {
-		    void* raw = nullptr;
-		    ret = ::dds_DataReader_take_next_loaned_sample(self, &raw, info);
-		    return ret == dds_RETCODE_OK ? raw : nullptr;
-	    },
-	    cleanup);
-	return ret;
+	return raii::dds_DataReader_read_next_loaned_sample(self, *sample, info);
+}
+
+template <typename TReader>
+inline ::dds_ReturnCode_t dds_DataReader_take_next_loaned_sample(
+    const TReader& self, dds_ReaderLoan& sample, ::dds_SampleInfoEx* info) {
+	return detail::ReadSampleLoan(self, sample, info, ::dds_DataReader_take_next_loaned_sample);
+}
+
+template <typename TReader>
+inline ::dds_ReturnCode_t dds_DataReader_take_next_loaned_sample(
+    const TReader& self, dds_ReaderLoan* sample, ::dds_SampleInfoEx* info) {
+	if(!sample)
+		return dds_RETCODE_BAD_PARAMETER;
+	return raii::dds_DataReader_take_next_loaned_sample(self, *sample, info);
 }
 
 class StatusCondition {
@@ -3873,29 +4154,12 @@ inline ::dds_ReturnCode_t dds_WaitSet_detach_condition(const dds_WaitSet& self, 
 // C API: no public per-builder delete exists. Keep those as native C handles.
 // Likewise get/lookup/find results remain borrowed and must not be adopted.
 
-using dds_Wstring = Resource<uint16_t, dds_Memory_deleter>;
-using dds_WideString = Resource<wchar_t, dds_Memory_deleter>;
-
 inline void dds_free(dds_Wstring& value) noexcept {
 	value.reset();
 }
 
 inline void dds_free(dds_WideString& value) noexcept {
 	value.reset();
-}
-
-inline dds_Wstring dds_wcsdup(const uint16_t* value) {
-	return dds_Wstring::Create([=]() { return ::dds_wcsdup(value); });
-}
-
-inline bool dds_WstringSeq_add(dds_WstringSeq& sequence, dds_Wstring&& value) noexcept {
-	return detail::SequenceItemAccess::Add(sequence, value, ::dds_WstringSeq_add);
-}
-
-inline bool dds_WstringSeq_add(dds_WstringSeq& sequence, const uint16_t* value) {
-	if(!sequence || !value)
-		return false;
-	return raii::dds_WstringSeq_add(sequence, raii::dds_wcsdup(value));
 }
 
 inline dds_Wstring dds_wide_to_utf16(const wchar_t* value) {
@@ -3930,43 +4194,71 @@ inline void dds_md5_ctx_free(dds_md5_ctx& context) noexcept {
 inline ::dds_ReturnCode_t dds_DynamicType_get_descriptor(::dds_DynamicType* self, dds_TypeDescriptor& value) noexcept {
 	if(!self)
 		return dds_RETCODE_BAD_PARAMETER;
-	(void)::dds_TypeDescriptor_finalize(value);
-	return ::dds_DynamicType_get_descriptor(self, value);
+	return detail::ReplaceScopedValue(
+	    value, [=](::dds_TypeDescriptor* next) { return ::dds_DynamicType_get_descriptor(self, next); });
+}
+
+inline ::dds_ReturnCode_t dds_DynamicType_get_descriptor(::dds_DynamicType* self, dds_TypeDescriptor* value) noexcept {
+	if(!value)
+		return dds_RETCODE_BAD_PARAMETER;
+	return raii::dds_DynamicType_get_descriptor(self, *value);
 }
 
 inline ::dds_ReturnCode_t dds_DynamicTypeMember_get_descriptor(
     ::dds_DynamicTypeMember* self, dds_MemberDescriptor& value) noexcept {
 	if(!self)
 		return dds_RETCODE_BAD_PARAMETER;
-	(void)::dds_MemberDescriptor_finalize(value);
-	return ::dds_DynamicTypeMember_get_descriptor(self, value);
+	return detail::ReplaceScopedValue(
+	    value, [=](::dds_MemberDescriptor* next) { return ::dds_DynamicTypeMember_get_descriptor(self, next); });
+}
+
+inline ::dds_ReturnCode_t dds_DynamicTypeMember_get_descriptor(
+    ::dds_DynamicTypeMember* self, dds_MemberDescriptor* value) noexcept {
+	if(!value)
+		return dds_RETCODE_BAD_PARAMETER;
+	return raii::dds_DynamicTypeMember_get_descriptor(self, *value);
 }
 
 inline ::dds_ReturnCode_t dds_DynamicData_get_descriptor(
     ::dds_DynamicData* self, dds_MemberDescriptor& value, ::dds_MemberId_t id) noexcept {
 	if(!self)
 		return dds_RETCODE_BAD_PARAMETER;
-	(void)::dds_MemberDescriptor_finalize(value);
-	return ::dds_DynamicData_get_descriptor(self, value, id);
+	return detail::ReplaceScopedValue(
+	    value, [=](::dds_MemberDescriptor* next) { return ::dds_DynamicData_get_descriptor(self, next, id); });
+}
+
+inline ::dds_ReturnCode_t dds_DynamicData_get_descriptor(
+    ::dds_DynamicData* self, dds_MemberDescriptor* value, ::dds_MemberId_t id) noexcept {
+	if(!value)
+		return dds_RETCODE_BAD_PARAMETER;
+	return raii::dds_DynamicData_get_descriptor(self, *value, id);
 }
 
 // Instance handles are values, not owned DDS entities.
 inline ::dds_InstanceHandle_t dds_DataWriter_lookup_instance(const dds_DataWriter& self, const void* data) {
-	return self ? ::dds_DataWriter_lookup_instance(self, data) : dds_HANDLE_NIL;
+	if(!self)
+		return dds_HANDLE_NIL;
+	return ::dds_DataWriter_lookup_instance(self, data);
 }
 
 inline ::dds_InstanceHandle_t dds_DataReader_lookup_instance(const dds_DataReader& self, const void* data) {
-	return self ? ::dds_DataReader_lookup_instance(self, data) : dds_HANDLE_NIL;
+	if(!self)
+		return dds_HANDLE_NIL;
+	return ::dds_DataReader_lookup_instance(self, data);
 }
 
 inline ::dds_InstanceHandle_t dds_DynamicDataWriter_lookup_instance(
     const dds_DataWriter& self, const ::dds_DynamicData* data) {
-	return self ? ::dds_DynamicDataWriter_lookup_instance(self, data) : dds_HANDLE_NIL;
+	if(!self)
+		return dds_HANDLE_NIL;
+	return ::dds_DynamicDataWriter_lookup_instance(self, data);
 }
 
 inline ::dds_InstanceHandle_t dds_DynamicDataReader_lookup_instance(
     const dds_DataReader& self, const ::dds_DynamicData* data) {
-	return self ? ::dds_DynamicDataReader_lookup_instance(self, data) : dds_HANDLE_NIL;
+	if(!self)
+		return dds_HANDLE_NIL;
+	return ::dds_DynamicDataReader_lookup_instance(self, data);
 }
 
 // Unlike entity lookups, the SDK allocates this sequence AND its type supports.
@@ -3993,7 +4285,7 @@ inline std::vector<dds_DynamicTypeSupport> dds_DomainParticipant_lookup_delivere
 		return result;
 	result.reserve(::dds_DataSeq_length(sequence.get()));
 	while(::dds_DataSeq_length(sequence.get()) != 0) {
-		result.push_back(dds_DynamicTypeSupport::Create(
+		result.push_back(detail::DynamicDataAccess::CreateSupport(
 		    [&]() { return static_cast<::dds_DynamicTypeSupport*>(::dds_DataSeq_remove(sequence.get(), 0)); }));
 	}
 	return result;

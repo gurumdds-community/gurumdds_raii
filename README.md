@@ -2,7 +2,7 @@
 
 A header-only C++11 RAII wrapper for the GurumDDS C API, providing automatic resource management and native API interoperability.
 
-`raii.hpp` adds ownership and lifetime management to the existing C API. Create resources with qualified `raii::dds_*` functions, then pass the resulting handles to native `::dds_*` functions when needed.
+`raii.hpp` adds ownership and lifetime management to the existing C API. The wrapper follows C function names and argument conventions wherever possible so existing call sites can adopt RAII with minimal changes. Create resources with qualified `raii::dds_*` functions, then pass the resulting handles directly to native `::dds_*` functions that borrow them.
 
 ## Features
 
@@ -91,7 +91,7 @@ int main() {
 
 ## Ownership and interoperability
 
-Use qualified `raii::dds_*` names for resource creation and deletion. Other operations can use the native `::dds_*` API through implicit pointer conversion. Prefer explicit qualification over `using namespace raii` to keep wrapper and native calls clear.
+Use qualified `raii::dds_*` names for resource creation, deletion, and operations that consume or replace a managed resource. Calls that borrow handles can use the native `::dds_*` API through implicit pointer conversion. Prefer explicit qualification over `using namespace raii` to keep wrapper and native calls clear.
 
 | Wrapper category | Ownership behavior |
 | --- | --- |
@@ -179,11 +179,11 @@ Release DDS resources and stop DDS worker threads before program exit. The wrapp
 
 ## Loans and resource release
 
-Managed reader sequence loans are returned when their participating sequence owners are destroyed or reused. The active loan retains its DataReader. Use the matching wrapper return-loan function when you need to return a loan explicitly and inspect the result.
+Managed reader sequence loans are returned when any participating sequence owner is destroyed or reused. The active loan retains its DataReader. Use the matching wrapper return-loan function when you need to return a loan explicitly and inspect the result. The `DataSeq` and `SampleInfoSeq` clone wrappers return an empty handle for active managed loans. The `DynamicDataSeq` clone wrapper copies the loaned samples.
 
-`Resource::release()` transfers a native pointer to the caller and disables automatic cleanup for that resource. It throws if a sequence loan is still active or another owner retains the resource state. After a successful transfer, the caller is responsible for the native resource's lifetime.
+`Resource::release()` transfers a native pointer and disables automatic cleanup for independently transferable resources. For loans and other dependent resources, pass the handle to the matching `raii::dds_*` operation. The wrapper retains the required DDS objects through the native operation.
 
-When transferring a writer loan to a native `raw_write` API, explicitly use `sample.release()` and follow that API's ownership rules. The wrapper does not infer loan ownership from a failed write's return code.
+Use `raii::dds_DataWriter_get_loan(writer, &sample, &capacity)` with a `raii::dds_WriterLoan` variable. After filling the buffer, call `raii::dds_DataWriter_raw_write(writer, sample, size)` or return it with `raii::dds_DataWriter_return_loaned_sample(writer, sample)`. The wrapper clears the handle when it returns the loan. Reader sample loans and DynamicData complex values also accept managed output parameters in the `&sample` form. QoS and descriptor wrappers support both `value` and `&value` for managed outputs.
 
 ## Important behavior
 
