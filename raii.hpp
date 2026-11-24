@@ -1306,7 +1306,7 @@ inline dds_DataWriter dds_Publisher_create_datawriter_w_profile(const dds_Publis
 	    detail::MakeRegisteredOwned<DataWriter>(raw, detail::SharedImpl(self), detail::SharedImpl(aTopic)));
 }
 
-// 등록된 토픽은 엔드포인트가 유지합니다. 외부 토픽의 수명은 호출자가 관리합니다.
+// Endpoints retain managed topics. Callers keep externally owned topics alive.
 inline dds_DataWriter dds_Publisher_create_datawriter(const dds_Publisher& self,
     const ::dds_Topic* aTopic,
     const ::dds_DataWriterQos* qos,
@@ -1452,7 +1452,7 @@ inline dds_DataReader dds_Subscriber_create_datareader(const dds_Subscriber& sel
 	return dds_DataReader(detail::MakeRegisteredOwned<DataReader>(raw, detail::SharedImpl(self), aTopic.GetOwner()));
 }
 
-// 등록된 토픽의 소유권은 토픽 설명 포인터를 통해서도 유지합니다.
+// Retain managed topics even when the caller passes a native topic description pointer.
 inline dds_DataReader dds_Subscriber_create_datareader(const dds_Subscriber& self,
     const ::dds_TopicDescription* aTopic,
     const ::dds_DataReaderQos* qos,
@@ -1690,7 +1690,7 @@ NativeOwnership GetNativeOwnership(const TDeleter&, ...) noexcept {
 	return NativeOwnership::Transferable;
 }
 
-// 여러 sequence가 하나의 loan을 가리킵니다. 첫 반환에서 전체 loan을 종료합니다.
+// Several sequences can share one loan. Returning any of them ends the entire loan.
 struct SequenceLoan {
 	std::shared_ptr<DataReader> m_reader;
 	::dds_DataSeq* m_data{};
@@ -2089,7 +2089,7 @@ template <typename TValue>
 }
 
 inline ::dds_ReturnCode_t CheckScopedOutput(::dds_DomainParticipantQos* qos, ::dds_ReturnCode_t ret) noexcept {
-	// C 복사가 첫 필드에서 실패하면 뒤 필드에는 원본 주소가 남습니다.
+	// If the native copy fails on the first field, later fields can still point into the source.
 	if(!qos->property.value)
 		qos->property.binary_value = nullptr;
 	if(ret == dds_RETCODE_OK && !qos->property.binary_value)
@@ -2119,7 +2119,7 @@ inline ::dds_ReturnCode_t CheckScopedOutput(::dds_DataReaderQos* qos, ::dds_Retu
 }
 
 inline ::dds_ReturnCode_t CheckScopedOutput(::dds_TypeDescriptor* descriptor, ::dds_ReturnCode_t ret) noexcept {
-	// C TypeDescriptor 복사는 오류 시 내부 필드를 해제한 뒤 포인터를 그대로 둡니다.
+	// On failure, the native TypeDescriptor copy frees internal fields and leaves their pointers set.
 	if(ret != dds_RETCODE_OK)
 		*descriptor = {};
 	return ret;
@@ -2291,7 +2291,7 @@ template <typename TEntity, typename TQos, typename TCopy>
 	if(!topic)
 		return dds_RETCODE_BAD_PARAMETER;
 
-	// 엔드포인트 전용 정책은 빌리고 C 복사가 교체하는 representation만 분리합니다.
+	// Preserve borrowed endpoint-specific policies and isolate the data representation the native copy replaces.
 	using TRaw = typename TQos::native_type;
 	auto* destination{static_cast<TRaw*>(qos)};
 	TRaw next{*destination};
@@ -2610,7 +2610,7 @@ struct DynamicDataAccess {
 		for(uint32_t index{}; index < count; ++index) {
 			auto* item{static_cast<::dds_DynamicData*>(::dds_DynamicDataSeq_get(raw, index))};
 			dds_DynamicData value;
-			// Reader loan 반환 후에도 복제본에서 타입을 사용하므로 Reader를 유지합니다.
+			// Keep the reader alive because cloned samples still use its type after the loan is returned.
 			if(reader)
 				value = Clone(item, reader);
 			else
@@ -2870,7 +2870,7 @@ struct SequenceItemAccess {
 private:
 	template <typename TItem>
 	static bool CanTransfer(const TItem& value) noexcept {
-		// 이 헬퍼는 sequence가 직접 해제할 수 있는 원소에만 사용합니다.
+		// Use this helper only for items that the sequence can free directly.
 		return value.m_state.use_count() == 1 && !value.m_state->m_registry && !value.m_state->m_loan;
 	}
 
@@ -2945,7 +2945,7 @@ inline dds_Wstring SequenceItemAccess::Copy<dds_Wstring>(const uint16_t* source)
 }
 } // namespace detail
 
-// 포인터는 복사하고, rvalue는 삽입이 성공하면 소유권을 넘깁니다.
+// Copy items passed by pointer. Transfer ownership of rvalues only after successful insertion.
 #define RAII_SEQUENCE_ITEM_DEFINE(sequence_type, item_type)                                                            \
 	inline bool sequence_type##_add(sequence_type& sequence, item_type&& value) noexcept {                             \
 		return detail::SequenceItemAccess::Add(sequence, value, ::sequence_type##_add);                                \
@@ -3043,7 +3043,7 @@ inline dds_DynamicData CreateDynamicData(
 }
 } // namespace detail
 
-// 등록되지 않은 타입의 수명은 호출자가 관리합니다.
+// The caller must keep types unknown to the RAII registry alive.
 inline dds_DynamicData dds_DynamicDataFactory_create_data(
     ::dds_DynamicDataFactory* self, const ::dds_DynamicType* type) {
 	return detail::CreateDynamicData(self, type, detail::DynamicDataAccess::GetTypeOwner(type));
@@ -3351,7 +3351,7 @@ template <typename TData, typename TRead>
 			return ret;
 	}
 
-	// 호출자가 채운 원소를 SDK가 반환할 loan에 섞으면 해제 정책을 판별할 수 없습니다.
+	// Mixing caller-supplied items with SDK loans makes their cleanup policy ambiguous.
 	if(GetLoanOutputLength(data.get()) != 0 || ::dds_SampleInfoSeq_length(infos.get()) != 0 ||
 	    (sizes && ::dds_UnsignedLongSeq_length(sizes->get()) != 0))
 		return dds_RETCODE_PRECONDITION_NOT_MET;
@@ -3399,7 +3399,7 @@ template <typename TData, typename TReturn>
 }
 } // namespace detail
 
-// 활성 loan에서 복제한 원소는 원본 loan 반환 이후에도 사용할 수 있습니다.
+// Items cloned from an active loan remain valid after the loan is returned.
 inline dds_DynamicDataSeq dds_DynamicDataSeq_clone(const dds_DynamicDataSeq& sequence) {
 	return raii::dds_DynamicDataSeq_clone(sequence.get());
 }
@@ -3894,8 +3894,8 @@ struct WriterLoanAccess {
 		if(cleanup->m_writer != writer || sample.m_state.use_count() != 1)
 			return dds_RETCODE_PRECONDITION_NOT_MET;
 
-		// SDK는 오류 시점에 따라 loan을 이미 소비할 수 있습니다.
-		// 원본을 먼저 반환하고 독립 버퍼로 쓰는 동안 Writer는 내부에서 유지합니다.
+		// The SDK may consume the loan before reporting a write error.
+		// Return the original loan first and retain the writer while writing from a separate buffer.
 		auto writerOwner{cleanup->m_owner};
 		std::unique_ptr<void, decltype(&::dds_free)> payload{::dds_malloc(size), ::dds_free};
 		if(!payload)
@@ -3968,7 +3968,7 @@ inline ::dds_ReturnCode_t dds_DataWriter_get_loan(const TWriter& self, dds_Write
 	return raii::dds_DataWriter_get_loan(self, *sample, size);
 }
 
-// 원본 loan은 native 쓰기 전에 반환되므로 이후 쓰기가 실패해도 반환된 상태입니다.
+// The original loan is returned before the native write, even if the write later fails.
 template <typename TWriter>
 inline ::dds_ReturnCode_t dds_DataWriter_raw_write(const TWriter& self, dds_WriterLoan& sample, uint32_t size) {
 	return detail::WriterLoanAccess::Write(self, sample, size, [size](::dds_DataWriter* writer, const void* raw) {
