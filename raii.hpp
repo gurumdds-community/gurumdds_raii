@@ -12,8 +12,8 @@
 
 #include <gurumdds/dds.h>
 // Header-only C++11 resource adapters for the supplied GurumDDS C API.
-// Use qualified raii::dds_* names for allocation/deallocation. Other operations
-// use the original ::dds_* functions through implicit native-pointer conversion.
+// Use qualified raii::dds_* names for ownership operations and managed listeners.
+// Other operations use the original ::dds_* functions through implicit native-pointer conversion.
 // Do not delete managed pointers through ::dds_* or delete_contained_entities:
 // the C API cannot notify outstanding C++ handles about external destruction.
 // Native listeners/context pointers remain borrowed, as in the C API.
@@ -23,6 +23,7 @@
 #include <condition_variable>
 #include <cstring>
 #include <exception>
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -95,6 +96,75 @@ inline void TerminateOnError(::dds_ReturnCode_t ret, const char* func) noexcept 
 inline ::dds_ReturnCode_t BadParameter() noexcept {
 	return dds_RETCODE_BAD_PARAMETER;
 }
+
+class ListenerRegistration {
+public:
+	ListenerRegistration() = default;
+	ListenerRegistration(const ListenerRegistration&) = delete;
+	ListenerRegistration& operator=(const ListenerRegistration&) = delete;
+
+	~ListenerRegistration() {
+		Release();
+	}
+
+	bool Prepare(const void* entity) {
+		if(m_registry)
+			return false;
+
+		auto registry{GetRegistry()};
+		std::lock_guard<std::mutex> lock{registry->m_mutex};
+		registry->m_registrations[entity] = this;
+		m_entity = entity;
+		m_registry = std::move(registry);
+		return true;
+	}
+
+	std::shared_ptr<const void> Replace(std::shared_ptr<const void> callback) {
+		std::lock_guard<std::mutex> lock{m_registry->m_mutex};
+		m_callback.swap(callback);
+		return callback;
+	}
+
+	std::shared_ptr<const void> Release() noexcept {
+		auto registry{std::move(m_registry)};
+		if(!registry)
+			return {};
+
+		std::lock_guard<std::mutex> lock{registry->m_mutex};
+		auto it{registry->m_registrations.find(m_entity)};
+		// 네이티브 삭제가 반환된 직후에는 다른 엔티티가 이 주소를 재사용할 수 있다.
+		if(it != registry->m_registrations.end() && it->second == this)
+			registry->m_registrations.erase(it);
+		m_entity = nullptr;
+		return std::move(m_callback);
+	}
+
+	static std::shared_ptr<const void> Find(const void* entity) {
+		const auto& registry{GetRegistry()};
+		std::lock_guard<std::mutex> lock{registry->m_mutex};
+		auto it{registry->m_registrations.find(entity)};
+		if(it == registry->m_registrations.end())
+			return {};
+		return it->second->m_callback;
+	}
+
+private:
+	struct Registry {
+		std::mutex m_mutex;
+		std::unordered_map<const void*, ListenerRegistration*> m_registrations;
+	};
+
+	static const std::shared_ptr<Registry>& GetRegistry() {
+		static const auto s_registry{std::make_shared<Registry>()};
+		return s_registry;
+	}
+
+	std::shared_ptr<Registry> m_registry;
+	const void* m_entity{nullptr};
+	std::shared_ptr<const void> m_callback;
+};
+
+struct ListenerAccess;
 
 inline void ClearListener(::dds_DomainParticipant* p) noexcept {
 	if(p == nullptr) {
@@ -392,7 +462,9 @@ public:
 private:
 	detail::LifecycleState m_lifecycle;
 	friend struct detail::LifecycleLock;
+	friend struct detail::ListenerAccess;
 	::dds_DomainParticipant* m_entity{nullptr};
+	detail::ListenerRegistration m_listener;
 };
 
 namespace detail {
@@ -482,8 +554,10 @@ public:
 	}
 
 private:
+	friend struct detail::ListenerAccess;
 	std::shared_ptr<DomainParticipant> m_parent;
 	::dds_Topic* m_entity{nullptr};
+	detail::ListenerRegistration m_listener;
 };
 
 class ContentFilteredTopic {
@@ -687,8 +761,10 @@ public:
 	}
 
 private:
+	friend struct detail::ListenerAccess;
 	std::shared_ptr<DomainParticipant> m_parent;
 	::dds_Publisher* m_entity{nullptr};
+	detail::ListenerRegistration m_listener;
 };
 
 class Subscriber {
@@ -714,8 +790,10 @@ public:
 	}
 
 private:
+	friend struct detail::ListenerAccess;
 	std::shared_ptr<DomainParticipant> m_parent;
 	::dds_Subscriber* m_entity{nullptr};
+	detail::ListenerRegistration m_listener;
 };
 
 class DataWriter {
@@ -742,9 +820,11 @@ public:
 	}
 
 private:
+	friend struct detail::ListenerAccess;
 	std::shared_ptr<Publisher> m_parent;
 	std::shared_ptr<Topic> m_topic;
 	::dds_DataWriter* m_entity{nullptr};
+	detail::ListenerRegistration m_listener;
 };
 
 class DataReader {
@@ -773,9 +853,11 @@ public:
 	}
 
 private:
+	friend struct detail::ListenerAccess;
 	std::shared_ptr<Subscriber> m_parent;
 	std::shared_ptr<void> m_topicDescriptionOwner;
 	::dds_DataReader* m_entity{nullptr};
+	detail::ListenerRegistration m_listener;
 };
 
 class ReadCondition {
@@ -909,6 +991,181 @@ private:
 
 #undef RAII_DDS_IMPL_OPERATORS
 
+namespace detail {
+
+template <typename TEntity>
+const TEntity* ListenerOwner(const TEntity* source, const TEntity*) {
+	return source;
+}
+
+inline const ::dds_Publisher* ListenerOwner(const ::dds_DataWriter* source, const ::dds_Publisher*) {
+	return ::dds_DataWriter_get_publisher(const_cast<::dds_DataWriter*>(source));
+}
+
+inline const ::dds_Subscriber* ListenerOwner(const ::dds_DataReader* source, const ::dds_Subscriber*) {
+	return ::dds_DataReader_get_subscriber(const_cast<::dds_DataReader*>(source));
+}
+
+inline const ::dds_DomainParticipant* ListenerOwner(const ::dds_Topic* source, const ::dds_DomainParticipant*) {
+	return ::dds_Topic_get_participant(const_cast<::dds_Topic*>(source));
+}
+
+inline const ::dds_DomainParticipant* ListenerOwner(const ::dds_Publisher* source, const ::dds_DomainParticipant*) {
+	return ::dds_Publisher_get_participant(const_cast<::dds_Publisher*>(source));
+}
+
+inline const ::dds_DomainParticipant* ListenerOwner(const ::dds_Subscriber* source, const ::dds_DomainParticipant*) {
+	return ::dds_Subscriber_get_participant(const_cast<::dds_Subscriber*>(source));
+}
+
+inline const ::dds_DomainParticipant* ListenerOwner(
+    const ::dds_DataWriter* source, const ::dds_DomainParticipant* kind) {
+	const auto* publisher{ListenerOwner(source, static_cast<const ::dds_Publisher*>(nullptr))};
+	return ListenerOwner(publisher, kind);
+}
+
+inline const ::dds_DomainParticipant* ListenerOwner(
+    const ::dds_DataReader* source, const ::dds_DomainParticipant* kind) {
+	const auto* subscriber{ListenerOwner(source, static_cast<const ::dds_Subscriber*>(nullptr))};
+	return ListenerOwner(subscriber, kind);
+}
+
+template <typename TCallback>
+using ListenerFunction = std::function<typename std::remove_pointer<TCallback>::type>;
+
+template <typename TOwner, typename TListener, typename TCallback>
+struct ListenerBridge;
+
+template <typename TOwner, typename TListener, typename TSource, typename... TArgs>
+struct ListenerBridge<TOwner, TListener, void (*)(const TSource*, TArgs...)> {
+	using Function = std::function<void(const TSource*, TArgs...)>;
+	using NativeCallback = void (*)(const TSource*, TArgs...);
+
+	template <Function TListener::* Field>
+	static NativeCallback Bind(const Function& callback) {
+		if(!callback)
+			return nullptr;
+		return &Invoke<Field>;
+	}
+
+private:
+	template <Function TListener::* Field>
+	static void Invoke(const TSource* source, TArgs... args) noexcept {
+		const auto* owner{ListenerOwner(source, static_cast<const TOwner*>(nullptr))};
+		const auto listener{std::static_pointer_cast<const TListener>(ListenerRegistration::Find(owner))};
+		if(listener && ((*listener).*Field))
+			((*listener).*Field)(source, args...);
+	}
+};
+
+struct ListenerAccess {
+	template <typename TImpl, typename TListener, typename TBind, typename TSet>
+	static ::dds_ReturnCode_t Set(
+	    const DDSEntity<TImpl>& self, const TListener* listener, ::dds_StatusMask mask, TBind bind, TSet set) {
+		if(!self)
+			return BadParameter();
+
+		decltype(bind(*listener)) native{};
+		std::shared_ptr<const TListener> next;
+		if(listener) {
+			next = std::make_shared<TListener>(*listener);
+			native = bind(*next);
+		}
+
+		std::shared_ptr<const void> retired;
+		auto lifecycleLock{LockLifecycle(SharedImpl(self))};
+		auto* raw{self.get()};
+		if(!raw)
+			return BadParameter();
+		auto& registration{SharedImpl(self)->m_listener};
+		if(!listener) {
+			const auto result{set(raw, nullptr, mask)};
+			if(result == dds_RETCODE_OK)
+				retired = registration.Release();
+			return result;
+		}
+
+		// SDK 호출 전에 조회 공간을 확보하고, 호출에 성공한 뒤 새 리스너를 공개한다.
+		const bool prepared{registration.Prepare(raw)};
+		const auto result{set(raw, &native, mask)};
+		if(result == dds_RETCODE_OK)
+			retired = registration.Replace(std::move(next));
+		else if(prepared)
+			registration.Release();
+		return result;
+	}
+
+	template <typename TImpl>
+	static std::shared_ptr<const void> Release(const DDSEntity<TImpl>& self) noexcept {
+		return SharedImpl(self)->m_listener.Release();
+	}
+};
+
+} // namespace detail
+
+#define RAII_DDS_TOPIC_CALLBACKS(X, Entity) X(Entity, on_inconsistent_topic)
+
+#define RAII_DDS_WRITER_CALLBACKS(X, Entity)                                                                           \
+	X(Entity, on_offered_deadline_missed)                                                                              \
+	X(Entity, on_offered_incompatible_qos)                                                                             \
+	X(Entity, on_liveliness_lost)                                                                                      \
+	X(Entity, on_publication_matched)
+
+#define RAII_DDS_READER_CALLBACKS(X, Entity)                                                                           \
+	X(Entity, on_requested_deadline_missed)                                                                            \
+	X(Entity, on_requested_incompatible_qos)                                                                           \
+	X(Entity, on_sample_rejected)                                                                                      \
+	X(Entity, on_liveliness_changed)                                                                                   \
+	X(Entity, on_data_available)                                                                                       \
+	X(Entity, on_subscription_matched)                                                                                 \
+	X(Entity, on_sample_lost)
+
+#define RAII_DDS_SUBSCRIBER_CALLBACKS(X, Entity)                                                                       \
+	RAII_DDS_READER_CALLBACKS(X, Entity)                                                                               \
+	X(Entity, on_data_on_readers)
+
+#define RAII_DDS_PARTICIPANT_CALLBACKS(X, Entity)                                                                      \
+	RAII_DDS_TOPIC_CALLBACKS(X, Entity)                                                                                \
+	RAII_DDS_WRITER_CALLBACKS(X, Entity)                                                                               \
+	RAII_DDS_SUBSCRIBER_CALLBACKS(X, Entity)
+
+#define RAII_DDS_DECLARE_CALLBACK(Entity, Field)                                                                       \
+	detail::ListenerFunction<decltype(::dds_##Entity##Listener::Field)> Field;
+
+#define RAII_DDS_BIND_CALLBACK(Entity, Field)                                                                          \
+	native.Field = detail::ListenerBridge<::dds_##Entity, dds_##Entity##Listener, decltype(native.Field)>::Bind<       \
+	    &dds_##Entity##Listener::Field>(managed.Field);
+
+#define RAII_DDS_DEFINE_LISTENER(Entity, Callbacks)                                                                    \
+	struct dds_##Entity##Listener {                                                                                    \
+		Callbacks(RAII_DDS_DECLARE_CALLBACK, Entity)                                                                   \
+	};                                                                                                                 \
+	inline ::dds_ReturnCode_t dds_##Entity##_set_listener(                                                             \
+	    const dds_##Entity& self, const dds_##Entity##Listener* listener, ::dds_StatusMask mask) {                     \
+		auto bind = [](const dds_##Entity##Listener& managed) {                                                        \
+			::dds_##Entity##Listener native{};                                                                         \
+			Callbacks(RAII_DDS_BIND_CALLBACK, Entity)                                                                  \
+			return native;                                                                                             \
+		};                                                                                                             \
+		return detail::ListenerAccess::Set(self, listener, mask, bind, ::dds_##Entity##_set_listener);                 \
+	}
+
+RAII_DDS_DEFINE_LISTENER(Topic, RAII_DDS_TOPIC_CALLBACKS)
+RAII_DDS_DEFINE_LISTENER(DataWriter, RAII_DDS_WRITER_CALLBACKS)
+RAII_DDS_DEFINE_LISTENER(DataReader, RAII_DDS_READER_CALLBACKS)
+RAII_DDS_DEFINE_LISTENER(Publisher, RAII_DDS_WRITER_CALLBACKS)
+RAII_DDS_DEFINE_LISTENER(Subscriber, RAII_DDS_SUBSCRIBER_CALLBACKS)
+RAII_DDS_DEFINE_LISTENER(DomainParticipant, RAII_DDS_PARTICIPANT_CALLBACKS)
+
+#undef RAII_DDS_DEFINE_LISTENER
+#undef RAII_DDS_BIND_CALLBACK
+#undef RAII_DDS_DECLARE_CALLBACK
+#undef RAII_DDS_PARTICIPANT_CALLBACKS
+#undef RAII_DDS_SUBSCRIBER_CALLBACKS
+#undef RAII_DDS_READER_CALLBACKS
+#undef RAII_DDS_WRITER_CALLBACKS
+#undef RAII_DDS_TOPIC_CALLBACKS
+
 // -----------------------------------------------------------------------------
 // DomainParticipantFactory wrappers
 // -----------------------------------------------------------------------------
@@ -949,6 +1206,7 @@ inline dds_DomainParticipant dds_DomainParticipantFactory_create_participant(::d
 
 inline ::dds_ReturnCode_t dds_DomainParticipantFactory_delete_participant(
     ::dds_DomainParticipantFactory* self, dds_DomainParticipant& aParticipant) {
+	std::shared_ptr<const void> retired;
 	auto lifecycleLock = detail::LockLifecycle(detail::SharedImpl(aParticipant));
 	std::lock_guard<std::recursive_mutex> factoryLock(detail::GetFactoryMutex());
 	// Exclude the one participant pin held by lifecycleLock.
@@ -959,6 +1217,7 @@ inline ::dds_ReturnCode_t dds_DomainParticipantFactory_delete_participant(
 	}
 	::dds_ReturnCode_t ret = ::dds_DomainParticipantFactory_delete_participant(self, aParticipant);
 	if(ret == dds_RETCODE_OK) {
+		retired = detail::ListenerAccess::Release(aParticipant);
 		*detail::SharedImpl(aParticipant) = nullptr;
 		aParticipant = nullptr;
 	}
@@ -1029,6 +1288,7 @@ inline dds_Publisher dds_DomainParticipant_create_publisher(const dds_DomainPart
 
 inline ::dds_ReturnCode_t dds_DomainParticipant_delete_publisher(
     const dds_DomainParticipant& self, dds_Publisher& publisher) {
+	std::shared_ptr<const void> retired;
 	auto lifecycleLock = detail::LockLifecycle(detail::SharedImpl(self));
 	if(!self || !publisher) {
 		return detail::BadParameter();
@@ -1038,6 +1298,7 @@ inline ::dds_ReturnCode_t dds_DomainParticipant_delete_publisher(
 	::dds_ReturnCode_t ret =
 	    ::dds_DomainParticipant_delete_publisher(static_cast<::dds_DomainParticipant*>(self), publisher);
 	if(ret == dds_RETCODE_OK) {
+		retired = detail::ListenerAccess::Release(publisher);
 		*detail::SharedImpl(publisher) = nullptr;
 		publisher = nullptr;
 	}
@@ -1059,6 +1320,7 @@ inline dds_Subscriber dds_DomainParticipant_create_subscriber(const dds_DomainPa
 
 inline ::dds_ReturnCode_t dds_DomainParticipant_delete_subscriber(
     const dds_DomainParticipant& self, dds_Subscriber& subscriber) {
+	std::shared_ptr<const void> retired;
 	auto lifecycleLock = detail::LockLifecycle(detail::SharedImpl(self));
 	if(!self || !subscriber) {
 		return detail::BadParameter();
@@ -1068,6 +1330,7 @@ inline ::dds_ReturnCode_t dds_DomainParticipant_delete_subscriber(
 	::dds_ReturnCode_t ret =
 	    ::dds_DomainParticipant_delete_subscriber(static_cast<::dds_DomainParticipant*>(self), subscriber);
 	if(ret == dds_RETCODE_OK) {
+		retired = detail::ListenerAccess::Release(subscriber);
 		*detail::SharedImpl(subscriber) = nullptr;
 		subscriber = nullptr;
 	}
@@ -1092,6 +1355,7 @@ inline dds_Topic dds_DomainParticipant_create_topic(const dds_DomainParticipant&
 }
 
 inline ::dds_ReturnCode_t dds_DomainParticipant_delete_topic(const dds_DomainParticipant& self, dds_Topic& topic) {
+	std::shared_ptr<const void> retired;
 	auto lifecycleLock = detail::LockLifecycle(detail::SharedImpl(self));
 	if(!self || !topic) {
 		return detail::BadParameter();
@@ -1100,6 +1364,7 @@ inline ::dds_ReturnCode_t dds_DomainParticipant_delete_topic(const dds_DomainPar
 		return dds_RETCODE_PRECONDITION_NOT_MET;
 	::dds_ReturnCode_t ret = ::dds_DomainParticipant_delete_topic(static_cast<::dds_DomainParticipant*>(self), topic);
 	if(ret == dds_RETCODE_OK) {
+		retired = detail::ListenerAccess::Release(topic);
 		*detail::SharedImpl(topic) = nullptr;
 		topic = nullptr;
 	}
@@ -1354,6 +1619,7 @@ inline dds_DataWriter dds_Publisher_create_datawriter_w_profile(const dds_Publis
 }
 
 inline ::dds_ReturnCode_t dds_Publisher_delete_datawriter(const dds_Publisher& self, dds_DataWriter& aDatawriter) {
+	std::shared_ptr<const void> retired;
 	auto lifecycleLock = detail::LockLifecycle(detail::SharedImpl(self));
 	if(!self || !aDatawriter) {
 		return detail::BadParameter();
@@ -1362,6 +1628,7 @@ inline ::dds_ReturnCode_t dds_Publisher_delete_datawriter(const dds_Publisher& s
 		return dds_RETCODE_PRECONDITION_NOT_MET;
 	::dds_ReturnCode_t ret = ::dds_Publisher_delete_datawriter(static_cast<::dds_Publisher*>(self), aDatawriter);
 	if(ret == dds_RETCODE_OK) {
+		retired = detail::ListenerAccess::Release(aDatawriter);
 		*detail::SharedImpl(aDatawriter) = nullptr;
 		aDatawriter = nullptr;
 	}
@@ -1499,6 +1766,7 @@ inline dds_DataReader dds_Subscriber_create_datareader_w_profile(const dds_Subsc
 }
 
 inline ::dds_ReturnCode_t dds_Subscriber_delete_datareader(const dds_Subscriber& self, dds_DataReader& aDatareader) {
+	std::shared_ptr<const void> retired;
 	auto lifecycleLock = detail::LockLifecycle(detail::SharedImpl(self));
 	if(!self || !aDatareader) {
 		return detail::BadParameter();
@@ -1507,6 +1775,7 @@ inline ::dds_ReturnCode_t dds_Subscriber_delete_datareader(const dds_Subscriber&
 		return dds_RETCODE_PRECONDITION_NOT_MET;
 	::dds_ReturnCode_t ret = ::dds_Subscriber_delete_datareader(static_cast<::dds_Subscriber*>(self), aDatareader);
 	if(ret == dds_RETCODE_OK) {
+		retired = detail::ListenerAccess::Release(aDatareader);
 		*detail::SharedImpl(aDatareader) = nullptr;
 		aDatareader = nullptr;
 	}

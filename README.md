@@ -1,7 +1,5 @@
 # GurumDDS RAII
 
-[한국어](README.kr.md)
-
 `raii.hpp` is a header-only C++11 wrapper that manages resources from the GurumDDS C API. Use qualified `raii::dds_*` functions to create, release, or replace managed resources. Pass the handles directly to native `::dds_*` functions that only borrow them.
 
 ## Installation
@@ -56,11 +54,49 @@ int main() {
 
 Keep an owner alive while using a borrowed pointer. Use the matching `raii::dds_*_delete_*` function for explicit entity deletion and check the return code. Other owners can prevent deletion with `dds_RETCODE_PRECONDITION_NOT_MET`. Native delete functions and `delete_contained_entities` bypass wrapper ownership. Only pass owning pointers to resource constructors, and use `release()` only for independently transferable resources.
 
-Listener context pointers and objects accessed through them are borrowed. Keep them valid until callbacks have finished. The wrapper does not wait for in-flight callbacks. Synchronize shared access to handles and native resources as required.
-
 Native creation failures that return null yield empty handles. C++ allocation failures can throw. Check entity handles before implicit native pointer conversion, which throws for an empty or closed entity. A checked native cleanup failure in a destructor calls `std::terminate()`.
 
 Obtaining the Participant Factory through `raii::dds_DomainParticipantFactory_get_instance()` registers normal-exit cleanup for the DDS factories. Release DDS resources and stop threads that use DDS before factory cleanup runs.
+
+## Managed listeners
+
+After creating a DataReader, DataWriter, Topic, Subscriber, Publisher, or DomainParticipant, use its `raii::dds_*Listener` and `raii::dds_*_set_listener()` to register a listener. The fields use the SDK callback names and argument types. Pass another listener to replace the current one, or `nullptr, 0` to remove it. Check the return code. A failed SDK call preserves the previous managed registration.
+
+In this example, the application owns a `foo` that holds the Reader, and `get_foo()` returns a shared reference to it. The listener captures a `weak_ptr` to avoid an ownership cycle. Each successful `lock()` keeps the `foo` alive for that invocation.
+
+```cpp
+struct foo {
+	raii::dds_DataReader reader;
+	void on_data(const dds_DataReader* source);
+};
+
+std::shared_ptr<foo> get_foo();
+
+void f() {
+	const auto bar{get_foo()};
+	if(!bar)
+		return;
+
+	const std::weak_ptr<foo> weak_foo{bar};
+	raii::dds_DataReaderListener listener{};
+	listener.on_data_available = [weak_foo](const dds_DataReader* source) {
+		auto locked_foo{weak_foo.lock()};
+		if(!locked_foo)
+			return;
+
+		locked_foo->on_data(source);
+	};
+
+	const dds_ReturnCode_t result{
+	    raii::dds_DataReader_set_listener(bar->reader, &listener, dds_DATA_AVAILABLE_STATUS)};
+	if(result != dds_RETCODE_OK)
+		throw std::runtime_error("failed to set Reader listener");
+}
+```
+
+The wrapper copies the listener and retains that copy and its value captures for each invocation that acquires it, even if the listener is subsequently replaced, removed, or the entity is deleted. The SDK selects the listener according to its status mask and propagation rules. An event queued by the SDK can reach the trampoline after a registration change and use the registration present at lookup time. Callbacks run outside the registration mutex. Synchronize access to shared callback data and keep exceptions inside the callback.
+
+The wrapper does not wait for callbacks or extend the lifetime of their native DDS pointers. For example, the native Participant delete can join its callback thread, and holding the managed listener alive does not allow continued use of a Reader after native deletion. Use the managed setter consistently after installing a managed listener. Existing C listeners passed at creation and their native context pointers remain borrowed. Managed registration leaves the SDK context pointer untouched.
 
 ## Loans and WaitSets
 
